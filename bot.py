@@ -7,20 +7,27 @@ then grants the user a role that gives access to a specific channel.
 Setup instructions are in README.md.
 """
 
+import io
 import os
+import time
 import logging
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
+from PIL import Image, ImageSequence
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("whitelist-bot")
 
 # ---------- CONFIG (set these as environment variables, see README) ----------
-DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-WHITELIST_ROLE_ID = int(os.environ["WHITELIST_ROLE_ID"])       # role that unlocks the channel
-GUILD_ID = int(os.environ["GUILD_ID"])                         # your server's ID
+DISCORD_TOKEN = os.environ["MTUzMjc0NjIyMjc3ODE5MTk3Mg.GLKAAp.yScwI2W4KOW5bEzmO11tM8Qq9RJ0MNH97rudG0"]
+WHITELIST_ROLE_ID = int(os.environ["1532682936996860024"])       # role that unlocks the channel
+GUILD_ID = int(os.environ["1532682447567716413"])                         # your server's ID
+# Role allowed to use /forceunwhitelist and /say. Falls back to "Manage Roles"
+# permission if this variable isn't set, so the bot still runs without it.
+ADMIN_ROLE_ID = int(os.environ["1532761383324614757"]) if os.environ.get("ADMIN_ROLE_ID") else None
+BOT_START_TIME = time.time()
 # -------------------------------------------------------------------------
 
 intents = discord.Intents.default()
@@ -40,6 +47,15 @@ async def roblox_user_exists(user_id: str) -> tuple[bool, str | None]:
                 # Roblox returns isBanned field too; still counts as "real" account
                 return True, data.get("name")
             return False, None
+
+
+def is_staff(member: discord.Member) -> bool:
+    """True if member has the configured admin role, or Manage Roles / Administrator perms."""
+    if member.guild_permissions.administrator or member.guild_permissions.manage_roles:
+        return True
+    if ADMIN_ROLE_ID is not None:
+        return any(r.id == ADMIN_ROLE_ID for r in member.roles)
+    return False
 
 
 @bot.event
@@ -110,6 +126,183 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
         f"✅ Verified! Roblox account **{username}** (`{roblox_user_id}`) is real. "
         f"You've been given access to the channel.",
         ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="info",
+    description="Show info about this bot",
+    guild=discord.Object(id=GUILD_ID),
+)
+async def info(interaction: discord.Interaction):
+    uptime_seconds = int(time.time() - BOT_START_TIME)
+    hours, remainder = divmod(uptime_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    uptime_str = f"{hours}h {minutes}m {seconds}s"
+
+    embed = discord.Embed(title=f"{bot.user.name} — Info", color=discord.Color.blurple())
+    embed.add_field(name="Uptime", value=uptime_str, inline=True)
+    embed.add_field(name="Servers", value=str(len(bot.guilds)), inline=True)
+    embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    embed.add_field(
+        name="Commands",
+        value="/whitelist, /unwhitelist, /forceunwhitelist, /info, /say, /imagetogif",
+        inline=False,
+    )
+    embed.set_footer(text=f"Bot ID: {bot.user.id}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="unwhitelist",
+    description="Remove your own whitelist access",
+    guild=discord.Object(id=GUILD_ID),
+)
+async def unwhitelist(interaction: discord.Interaction):
+    guild = interaction.guild
+    role = guild.get_role(WHITELIST_ROLE_ID)
+    if role is None:
+        await interaction.response.send_message(
+            "⚠️ Whitelist role isn't configured correctly. Contact an admin.",
+            ephemeral=True,
+        )
+        return
+
+    member = interaction.user
+    if role not in member.roles:
+        await interaction.response.send_message(
+            "ℹ️ You don't currently have whitelist access.", ephemeral=True
+        )
+        return
+
+    try:
+        await member.remove_roles(role, reason="Self-unwhitelisted")
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "⚠️ I don't have permission to remove that role. Contact an admin.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        "✅ You've been unwhitelisted and no longer have access to the channel.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="forceunwhitelist",
+    description="[Staff only] Remove whitelist access from another user",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(member="The member to unwhitelist")
+async def forceunwhitelist(interaction: discord.Interaction, member: discord.Member):
+    if not is_staff(interaction.user):
+        await interaction.response.send_message(
+            "❌ You don't have permission to use this command.", ephemeral=True
+        )
+        return
+
+    guild = interaction.guild
+    role = guild.get_role(WHITELIST_ROLE_ID)
+    if role is None:
+        await interaction.response.send_message(
+            "⚠️ Whitelist role isn't configured correctly. Contact an admin.",
+            ephemeral=True,
+        )
+        return
+
+    if role not in member.roles:
+        await interaction.response.send_message(
+            f"ℹ️ {member.mention} doesn't currently have whitelist access.", ephemeral=True
+        )
+        return
+
+    try:
+        await member.remove_roles(role, reason=f"Force-unwhitelisted by {interaction.user}")
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "⚠️ I don't have permission to remove that role from that member "
+            "(check my role is above the whitelist role).",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"✅ {member.mention} has been forcefully unwhitelisted.", ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="say",
+    description="[Staff only] Make the bot say something in this channel",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(message="What the bot should say")
+async def say(interaction: discord.Interaction, message: str):
+    if not is_staff(interaction.user):
+        await interaction.response.send_message(
+            "❌ You don't have permission to use this command.", ephemeral=True
+        )
+        return
+
+    # Confirm privately first, then post publicly, so it's not silently anonymous to the requester
+    await interaction.response.send_message("✅ Sent.", ephemeral=True)
+    await interaction.channel.send(message)
+
+
+@bot.tree.command(
+    name="imagetogif",
+    description="Convert an uploaded image into a GIF",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(image="The image to convert (png/jpg/webp/gif)")
+async def imagetogif(interaction: discord.Interaction, image: discord.Attachment):
+    await interaction.response.defer()
+
+    if not (image.content_type and image.content_type.startswith("image/")):
+        await interaction.followup.send("❌ That attachment isn't an image.", ephemeral=True)
+        return
+
+    MAX_SIZE = 8 * 1024 * 1024  # 8MB safety limit
+    if image.size > MAX_SIZE:
+        await interaction.followup.send(
+            "❌ That image is too large to convert (max 8MB).", ephemeral=True
+        )
+        return
+
+    try:
+        image_bytes = await image.read()
+        source = Image.open(io.BytesIO(image_bytes))
+
+        output_buffer = io.BytesIO()
+        if getattr(source, "is_animated", False):
+            # Already an animated image (e.g. animated webp) -> re-encode all frames as GIF
+            frames = [frame.convert("RGBA") for frame in ImageSequence.Iterator(source)]
+            frames[0].save(
+                output_buffer,
+                format="GIF",
+                save_all=True,
+                append_images=frames[1:],
+                loop=0,
+                duration=source.info.get("duration", 100),
+            )
+        else:
+            # Static image -> single-frame looping GIF
+            source.convert("RGBA").save(output_buffer, format="GIF")
+
+        output_buffer.seek(0)
+    except Exception as e:
+        log.exception("Error converting image to GIF: %s", e)
+        await interaction.followup.send(
+            "⚠️ Something went wrong converting that image.", ephemeral=True
+        )
+        return
+
+    filename = os.path.splitext(image.filename)[0] + ".gif"
+    await interaction.followup.send(
+        content="✅ Here's your GIF:",
+        file=discord.File(fp=output_buffer, filename=filename),
     )
 
 
