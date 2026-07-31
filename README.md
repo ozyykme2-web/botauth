@@ -24,7 +24,9 @@ channel.
 
 1. In your Discord server, create a role (e.g. `Whitelisted`).
 2. **Important:** In Server Settings → Roles, drag the bot's own role **above**
-   the `Whitelisted` role — a bot can only grant roles ranked below its own.
+   the `Whitelisted` role (and above any staff/admin role you use for
+   `ADMIN_ROLE_ID`, if it also needs role management) — a bot can only grant
+   or remove roles ranked below its own.
 3. Go to your restricted channel → Edit Channel → Permissions:
    - Deny `View Channel` for `@everyone`.
    - Add the `Whitelisted` role and allow `View Channel` for it.
@@ -41,7 +43,13 @@ where to put them):
 DISCORD_TOKEN=your_bot_token_here
 WHITELIST_ROLE_ID=123456789012345678
 GUILD_ID=123456789012345678
+ADMIN_ROLE_ID=123456789012345678
 ```
+
+`ADMIN_ROLE_ID` is optional — it's the role allowed to use `/forceunwhitelist` and `/say`.
+If you don't set it, anyone with the **Manage Roles** or **Administrator**
+permission can still use those commands; the role is just an extra way to
+grant access without giving full admin perms.
 
 ## 4. Install dependencies (only needed if testing locally first)
 
@@ -58,11 +66,36 @@ python bot.py
 
 ## How to use it (for your server members)
 
+### `/whitelist <roblox_user_id>`
 1. Type `/whitelist` in any channel the bot can see.
 2. Enter your **Roblox User ID** (the numeric ID, found in your Roblox
    profile URL, e.g. `https://www.roblox.com/users/123456789/profile` → ID is `123456789`).
 3. The bot checks Roblox and, if valid, instantly gives you the role that
    unlocks the restricted channel.
+
+### `/unwhitelist`
+Removes the whitelist role from **yourself**. Anyone can use this on their
+own account at any time.
+
+### `/forceunwhitelist <member>` — staff only
+Removes the whitelist role from **another member**. Only usable by someone
+with the `ADMIN_ROLE_ID` role, or the **Manage Roles**/**Administrator**
+permission.
+
+### `/info`
+Shows the bot's uptime, ping, server count, and a list of available commands.
+Anyone can use this.
+
+### `/say <message>` — staff only
+Makes the bot post a message in the current channel as itself. Restricted the
+same way as `/forceunwhitelist` (staff role or Manage Roles/Administrator),
+so it can't be used to impersonate or spam by regular members.
+
+### `/imagetogif <image>`
+Upload an image (png/jpg/webp/gif, up to 8MB) and the bot converts it into a
+`.gif` file and sends it back in the channel. If you upload an already
+animated image (like an animated webp), it preserves the animation frames;
+static images become a single-frame looping GIF.
 
 ---
 
