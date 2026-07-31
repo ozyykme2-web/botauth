@@ -9,64 +9,76 @@ import io
 import os
 import time
 import logging
+import traceback
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 from PIL import Image, ImageSequence
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 log = logging.getLogger("whitelist-bot")
 
-# ---------- CONFIG (set these as environment variables, see README) ----------
+# ---------- CONFIG ----------
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-WHITELIST_ROLE_ID = int(os.environ["WHITELIST_ROLE_ID"])  # role that unlocks the channel
-GUILD_ID = int(os.environ["GUILD_ID"])  # your server's ID
-# Role allowed to use /forceunwhitelist and /say. Falls back to "Manage Roles"
-# permission if this variable isn't set, so the bot still runs without it.
+WHITELIST_ROLE_ID = int(os.environ["WHITELIST_ROLE_ID"])
+GUILD_ID = int(os.environ["GUILD_ID"])
 ADMIN_ROLE_ID = int(os.environ["ADMIN_ROLE_ID"]) if os.environ.get("ADMIN_ROLE_ID") else None
 BOT_START_TIME = time.time()
-# Channel to log bot usage into
 LOG_CHANNEL_ID = 1532740214320267425
 # -------------------------------------------------------------------------
 
 intents = discord.Intents.default()
-intents.members = True  # needed to add roles to members
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 async def log_usage(content: str):
-    """Send a short usage log to the configured log channel. Never raises."""
+    """Send a usage log. Always prints to console so we can see failures."""
+    log.info("LOG ATTEMPT: %s", content)
     try:
         channel = bot.get_channel(LOG_CHANNEL_ID)
         if channel is None:
+            log.info("Channel not in cache, fetching %s ...", LOG_CHANNEL_ID)
             channel = await bot.fetch_channel(LOG_CHANNEL_ID)
         if channel is None:
-            log.warning("Log channel %s not found", LOG_CHANNEL_ID)
+            log.error("Log channel %s returned None", LOG_CHANNEL_ID)
             return
+        log.info(
+            "Sending to channel type=%s name=%s guild=%s",
+            type(channel).__name__,
+            getattr(channel, "name", "?"),
+            getattr(getattr(channel, "guild", None), "id", "?"),
+        )
         await channel.send(content)
-        log.info("Usage log sent: %s", content[:80])
-    except discord.Forbidden:
-        log.warning(
-            "No permission to send in log channel %s (need View Channel + Send Messages)",
+        log.info("Log message sent OK")
+    except discord.Forbidden as e:
+        log.error(
+            "FORBIDDEN sending to log channel %s — bot needs View Channel + Send Messages. Error: %s",
             LOG_CHANNEL_ID,
+            e,
+        )
+    except discord.NotFound as e:
+        log.error(
+            "NOT FOUND — channel %s does not exist or bot is not in that server. Error: %s",
+            LOG_CHANNEL_ID,
+            e,
         )
     except Exception as e:
-        log.warning("Failed to send usage log: %s", e)
+        log.error("Log send failed: %s\n%s", e, traceback.format_exc())
 
 async def roblox_user_exists(user_id: str) -> tuple[bool, str | None]:
-    """Check Roblox's public API to see if a user ID corresponds to a real account.
-    Returns (exists, username_or_none)."""
     url = f"https://users.roblox.com/v1/users/{user_id}"
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                # Roblox returns isBanned field too; still counts as "real" account
                 return True, data.get("name")
             return False, None
 
 def is_staff(member: discord.Member) -> bool:
-    """True if member has the configured admin role, or Manage Roles / Administrator perms."""
     if member.guild_permissions.administrator or member.guild_permissions.manage_roles:
         return True
     if ADMIN_ROLE_ID is not None:
@@ -78,16 +90,15 @@ async def on_ready():
     try:
         guild = discord.Object(id=GUILD_ID)
         synced = await bot.tree.sync(guild=guild)
-        log.info(f"Synced {len(synced)} command(s) to guild {GUILD_ID}")
+        log.info("Synced %s command(s) to guild %s", len(synced), GUILD_ID)
     except Exception as e:
         log.exception("Failed to sync commands: %s", e)
-    log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    # Quick check that the log channel is reachable
-    try:
-        ch = bot.get_channel(LOG_CHANNEL_ID) or await bot.fetch_channel(LOG_CHANNEL_ID)
-        log.info("Log channel OK: %s (%s)", getattr(ch, "name", "?"), LOG_CHANNEL_ID)
-    except Exception as e:
-        log.warning("Cannot access log channel %s: %s", LOG_CHANNEL_ID, e)
+
+    log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
+    log.info("Guilds the bot is in: %s", [g.id for g in bot.guilds])
+
+    # Force a startup test message so we know logging works (or see the exact error)
+    await log_usage(f"🟢 Bot online — logging test from `{bot.user}`")
 
 @bot.tree.command(
     name="whitelist",
@@ -97,6 +108,8 @@ async def on_ready():
 @app_commands.describe(roblox_user_id="Your numeric Roblox User ID")
 async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
     await interaction.response.defer(ephemeral=True)
+    member = interaction.user
+    guild = interaction.guild
 
     if not roblox_user_id.isdigit():
         await interaction.followup.send(
@@ -104,19 +117,13 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
             ephemeral=True,
         )
         await log_usage(
-            f"❌ **whitelist** failed — {interaction.user.mention} (`{interaction.user.id}`) invalid ID `{roblox_user_id}`"
+            f"❌ **whitelist** failed — {member.mention} (`{member.id}`) invalid ID `{roblox_user_id}`"
         )
         return
 
-    # Already has the role? Don't do it again.
-    guild = interaction.guild
     role = guild.get_role(WHITELIST_ROLE_ID) if guild else None
-    member = interaction.user
     if role is not None and role in member.roles:
-        await interaction.followup.send(
-            "ℹ️ You are already whitelisted.",
-            ephemeral=True,
-        )
+        await interaction.followup.send("ℹ️ You are already whitelisted.", ephemeral=True)
         await log_usage(
             f"ℹ️ **whitelist** skipped — {member.mention} (`{member.id}`) already has the role"
         )
@@ -150,9 +157,7 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
             "⚠️ Whitelist role isn't configured correctly. Contact an admin.",
             ephemeral=True,
         )
-        await log_usage(
-            f"⚠️ **whitelist** config error — role {WHITELIST_ROLE_ID} not found"
-        )
+        await log_usage(f"⚠️ **whitelist** config error — role {WHITELIST_ROLE_ID} not found")
         return
 
     try:
@@ -197,9 +202,7 @@ async def info(interaction: discord.Interaction):
     )
     embed.set_footer(text=f"Bot ID: {bot.user.id}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
-    await log_usage(
-        f"ℹ️ **info** — {interaction.user.mention} (`{interaction.user.id}`)"
-    )
+    await log_usage(f"ℹ️ **info** — {interaction.user.mention} (`{interaction.user.id}`)")
 
 @bot.tree.command(
     name="unwhitelist",
@@ -290,7 +293,6 @@ async def say(interaction: discord.Interaction, message: str):
             "❌ You don't have permission to use this command.", ephemeral=True
         )
         return
-    # Confirm privately first, then post publicly, so it's not silently anonymous to the requester
     await interaction.response.send_message("✅ Sent.", ephemeral=True)
     await interaction.channel.send(message)
     await log_usage(
@@ -308,7 +310,7 @@ async def imagetogif(interaction: discord.Interaction, image: discord.Attachment
     if not (image.content_type and image.content_type.startswith("image/")):
         await interaction.followup.send("❌ That attachment isn't an image.", ephemeral=True)
         return
-    MAX_SIZE = 8 * 1024 * 1024  # 8MB safety limit
+    MAX_SIZE = 8 * 1024 * 1024
     if image.size > MAX_SIZE:
         await interaction.followup.send(
             "❌ That image is too large to convert (max 8MB).", ephemeral=True
@@ -319,7 +321,6 @@ async def imagetogif(interaction: discord.Interaction, image: discord.Attachment
         source = Image.open(io.BytesIO(image_bytes))
         output_buffer = io.BytesIO()
         if getattr(source, "is_animated", False):
-            # Already an animated image (e.g. animated webp) -> re-encode all frames as GIF
             frames = [frame.convert("RGBA") for frame in ImageSequence.Iterator(source)]
             frames[0].save(
                 output_buffer,
@@ -330,7 +331,6 @@ async def imagetogif(interaction: discord.Interaction, image: discord.Attachment
                 duration=source.info.get("duration", 100),
             )
         else:
-            # Static image -> single-frame looping GIF
             source.convert("RGBA").save(output_buffer, format="GIF")
         output_buffer.seek(0)
     except Exception as e:
