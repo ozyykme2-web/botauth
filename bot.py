@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("whitelist-bot")
 
 # ---------- CONFIG (set these as environment variables, see README) ----------
-DISCORD_TOKEN = os.environ["MTUzMjc0NjIyMjc3ODE5MTk3Mg.GLKAAp.yScwI2W4KOW5bEzmO11tM8Qq9RJ0MNH97rudG0"]
+DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 WHITELIST_ROLE_ID = int(os.environ["1532682936996860024"])       # role that unlocks the channel
 GUILD_ID = int(os.environ["1532682447567716413"])                         # your server's ID
 # Role allowed to use /forceunwhitelist and /say. Falls back to "Manage Roles"
