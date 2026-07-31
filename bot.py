@@ -14,8 +14,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from PIL import Image, ImageSequence
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("whitelist-bot")
+
 # ---------- CONFIG (set these as environment variables, see README) ----------
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 WHITELIST_ROLE_ID = int(os.environ["WHITELIST_ROLE_ID"])  # role that unlocks the channel
@@ -27,20 +29,27 @@ BOT_START_TIME = time.time()
 # Channel to log bot usage into
 LOG_CHANNEL_ID = 1532740214320267425
 # -------------------------------------------------------------------------
+
 intents = discord.Intents.default()
 intents.members = True  # needed to add roles to members
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-async def log_usage(guild: discord.Guild | None, content: str):
+async def log_usage(content: str):
     """Send a short usage log to the configured log channel. Never raises."""
-    if guild is None:
-        return
     try:
-        channel = guild.get_channel(LOG_CHANNEL_ID)
+        channel = bot.get_channel(LOG_CHANNEL_ID)
         if channel is None:
             channel = await bot.fetch_channel(LOG_CHANNEL_ID)
-        if channel is not None:
-            await channel.send(content)
+        if channel is None:
+            log.warning("Log channel %s not found", LOG_CHANNEL_ID)
+            return
+        await channel.send(content)
+        log.info("Usage log sent: %s", content[:80])
+    except discord.Forbidden:
+        log.warning(
+            "No permission to send in log channel %s (need View Channel + Send Messages)",
+            LOG_CHANNEL_ID,
+        )
     except Exception as e:
         log.warning("Failed to send usage log: %s", e)
 
@@ -73,6 +82,12 @@ async def on_ready():
     except Exception as e:
         log.exception("Failed to sync commands: %s", e)
     log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    # Quick check that the log channel is reachable
+    try:
+        ch = bot.get_channel(LOG_CHANNEL_ID) or await bot.fetch_channel(LOG_CHANNEL_ID)
+        log.info("Log channel OK: %s (%s)", getattr(ch, "name", "?"), LOG_CHANNEL_ID)
+    except Exception as e:
+        log.warning("Cannot access log channel %s: %s", LOG_CHANNEL_ID, e)
 
 @bot.tree.command(
     name="whitelist",
@@ -82,12 +97,31 @@ async def on_ready():
 @app_commands.describe(roblox_user_id="Your numeric Roblox User ID")
 async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
     await interaction.response.defer(ephemeral=True)
+
     if not roblox_user_id.isdigit():
         await interaction.followup.send(
             "❌ That doesn't look like a valid Roblox User ID (must be numbers only).",
             ephemeral=True,
         )
+        await log_usage(
+            f"❌ **whitelist** failed — {interaction.user.mention} (`{interaction.user.id}`) invalid ID `{roblox_user_id}`"
+        )
         return
+
+    # Already has the role? Don't do it again.
+    guild = interaction.guild
+    role = guild.get_role(WHITELIST_ROLE_ID) if guild else None
+    member = interaction.user
+    if role is not None and role in member.roles:
+        await interaction.followup.send(
+            "ℹ️ You are already whitelisted.",
+            ephemeral=True,
+        )
+        await log_usage(
+            f"ℹ️ **whitelist** skipped — {member.mention} (`{member.id}`) already has the role"
+        )
+        return
+
     try:
         exists, username = await roblox_user_exists(roblox_user_id)
     except Exception as e:
@@ -96,23 +130,31 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
             "⚠️ Couldn't reach Roblox's servers right now. Try again in a moment.",
             ephemeral=True,
         )
+        await log_usage(
+            f"⚠️ **whitelist** API error — {member.mention} (`{member.id}`) Roblox ID `{roblox_user_id}`"
+        )
         return
+
     if not exists:
         await interaction.followup.send(
             f"❌ No Roblox account found with ID `{roblox_user_id}`. Double-check the ID and try again.",
             ephemeral=True,
         )
+        await log_usage(
+            f"❌ **whitelist** failed — {member.mention} (`{member.id}`) no Roblox account `{roblox_user_id}`"
+        )
         return
-    # Grant the whitelist role
-    guild = interaction.guild
-    role = guild.get_role(WHITELIST_ROLE_ID)
+
     if role is None:
         await interaction.followup.send(
             "⚠️ Whitelist role isn't configured correctly. Contact an admin.",
             ephemeral=True,
         )
+        await log_usage(
+            f"⚠️ **whitelist** config error — role {WHITELIST_ROLE_ID} not found"
+        )
         return
-    member = interaction.user
+
     try:
         await member.add_roles(role, reason=f"Whitelisted via Roblox ID {roblox_user_id}")
     except discord.Forbidden:
@@ -120,15 +162,18 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
             "⚠️ I don't have permission to give you that role. Contact an admin (my role must be above the whitelist role).",
             ephemeral=True,
         )
+        await log_usage(
+            f"⚠️ **whitelist** forbidden — cannot add role to {member.mention} (`{member.id}`)"
+        )
         return
+
     await interaction.followup.send(
         f"✅ Verified! Roblox account **{username}** (`{roblox_user_id}`) is real. "
         f"You've been given access to the channel.",
         ephemeral=True,
     )
     await log_usage(
-        guild,
-        f"✅ **whitelist** — {member.mention} (`{member.id}`) verified Roblox **{username}** (`{roblox_user_id}`)",
+        f"✅ **whitelist** — {member.mention} (`{member.id}`) verified Roblox **{username}** (`{roblox_user_id}`)"
     )
 
 @bot.tree.command(
@@ -153,8 +198,7 @@ async def info(interaction: discord.Interaction):
     embed.set_footer(text=f"Bot ID: {bot.user.id}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
     await log_usage(
-        interaction.guild,
-        f"ℹ️ **info** — {interaction.user.mention} (`{interaction.user.id}`)",
+        f"ℹ️ **info** — {interaction.user.mention} (`{interaction.user.id}`)"
     )
 
 @bot.tree.command(
@@ -190,8 +234,7 @@ async def unwhitelist(interaction: discord.Interaction):
         ephemeral=True,
     )
     await log_usage(
-        guild,
-        f"🔓 **unwhitelist** — {member.mention} (`{member.id}`) removed their own whitelist",
+        f"🔓 **unwhitelist** — {member.mention} (`{member.id}`) removed their own whitelist"
     )
 
 @bot.tree.command(
@@ -232,8 +275,7 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
         f"✅ {member.mention} has been forcefully unwhitelisted.", ephemeral=True
     )
     await log_usage(
-        guild,
-        f"🔨 **forceunwhitelist** — {interaction.user.mention} (`{interaction.user.id}`) removed whitelist from {member.mention} (`{member.id}`)",
+        f"🔨 **forceunwhitelist** — {interaction.user.mention} (`{interaction.user.id}`) removed whitelist from {member.mention} (`{member.id}`)"
     )
 
 @bot.tree.command(
@@ -252,8 +294,7 @@ async def say(interaction: discord.Interaction, message: str):
     await interaction.response.send_message("✅ Sent.", ephemeral=True)
     await interaction.channel.send(message)
     await log_usage(
-        interaction.guild,
-        f"📢 **say** — {interaction.user.mention} (`{interaction.user.id}`) in <#{interaction.channel.id}>: {message[:200]}{'…' if len(message) > 200 else ''}",
+        f"📢 **say** — {interaction.user.mention} (`{interaction.user.id}`) in <#{interaction.channel.id}>: {message[:200]}{'…' if len(message) > 200 else ''}"
     )
 
 @bot.tree.command(
@@ -304,8 +345,7 @@ async def imagetogif(interaction: discord.Interaction, image: discord.Attachment
         file=discord.File(fp=output_buffer, filename=filename),
     )
     await log_usage(
-        interaction.guild,
-        f"🖼️ **imagetogif** — {interaction.user.mention} (`{interaction.user.id}`) converted `{image.filename}`",
+        f"🖼️ **imagetogif** — {interaction.user.mention} (`{interaction.user.id}`) converted `{image.filename}`"
     )
 
 if __name__ == "__main__":
