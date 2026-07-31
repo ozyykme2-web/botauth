@@ -22,11 +22,11 @@ log = logging.getLogger("whitelist-bot")
 
 # ---------- CONFIG (set these as environment variables, see README) ----------
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-WHITELIST_ROLE_ID = int(os.environ["1532682936996860024"])       # role that unlocks the channel
-GUILD_ID = int(os.environ["1532682447567716413"])                         # your server's ID
+WHITELIST_ROLE_ID = int(os.environ["WHITELIST_ROLE_ID"])       # role that unlocks the channel
+GUILD_ID = int(os.environ["GUILD_ID"])                         # your server's ID
 # Role allowed to use /forceunwhitelist and /say. Falls back to "Manage Roles"
 # permission if this variable isn't set, so the bot still runs without it.
-ADMIN_ROLE_ID = int(os.environ["1532761383324614757"]) if os.environ.get("ADMIN_ROLE_ID") else None
+ADMIN_ROLE_ID = int(os.environ["ADMIN_ROLE_ID"]) if os.environ.get("ADMIN_ROLE_ID") else None
 BOT_START_TIME = time.time()
 # -------------------------------------------------------------------------
 
