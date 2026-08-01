@@ -3,8 +3,6 @@ Discord Roblox Whitelist Bot
 -----------------------------
 /whitelist <roblox_user_id>  -> verifies the ID is a real Roblox account,
 then grants the user a role that gives access to a specific channel.
-
-Setup instructions are in README.md.
 """
 
 import io
@@ -12,6 +10,7 @@ import os
 import time
 import logging
 import aiohttp
+import aiomysql
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -20,37 +19,138 @@ from PIL import Image, ImageSequence
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("whitelist-bot")
 
-# ---------- CONFIG (set these as environment variables, see README) ----------
+# ---------- CONFIG ----------
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-WHITELIST_ROLE_ID = int(os.environ["WHITELIST_ROLE_ID"])       # role that unlocks the channel
-GUILD_ID = int(os.environ["GUILD_ID"])                         # your server's ID
-# Role allowed to use /forceunwhitelist and /say. Falls back to "Manage Roles"
-# permission if this variable isn't set, so the bot still runs without it.
+WHITELIST_ROLE_ID = int(os.environ["WHITELIST_ROLE_ID"])
+GUILD_ID = int(os.environ["GUILD_ID"])
 ADMIN_ROLE_ID = int(os.environ["ADMIN_ROLE_ID"]) if os.environ.get("ADMIN_ROLE_ID") else None
 BOT_START_TIME = time.time()
-# -------------------------------------------------------------------------
+
+# ---------- MySQL (Railway) ----------
+MYSQL_HOST = os.environ["MYSQL_HOST"]
+MYSQL_PORT = int(os.environ.get("MYSQL_PORT", 3306))
+MYSQL_USER = os.environ["MYSQL_USER"]
+MYSQL_PASSWORD = os.environ["MYSQL_PASSWORD"]
+MYSQL_DATABASE = os.environ["MYSQL_DATABASE"]
+# ------------------------------------
 
 intents = discord.Intents.default()
-intents.members = True  # needed to add roles to members
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+bot.db_pool: aiomysql.Pool | None = None
 
+
+# ---------- Database ----------
+
+CREATE_TABLES_SQL = [
+    """
+    CREATE TABLE IF NOT EXISTS whitelist_attempts (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        discord_user_id BIGINT NOT NULL,
+        discord_username VARCHAR(255) NOT NULL,
+        roblox_user_id VARCHAR(64) NOT NULL,
+        roblox_username VARCHAR(255) NULL,
+        success BOOLEAN NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS whitelist_actions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        action VARCHAR(32) NOT NULL,
+        target_discord_id BIGINT NOT NULL,
+        target_username VARCHAR(255) NOT NULL,
+        actor_discord_id BIGINT NOT NULL,
+        actor_username VARCHAR(255) NOT NULL,
+        roblox_user_id VARCHAR(64) NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB
+    """,
+]
+
+
+async def init_db_pool() -> aiomysql.Pool:
+    pool = await aiomysql.create_pool(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        db=MYSQL_DATABASE,
+        autocommit=True,
+        minsize=1,
+        maxsize=5,
+    )
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            for statement in CREATE_TABLES_SQL:
+                await cur.execute(statement)
+    log.info("Connected to MySQL and ensured tables exist.")
+    return pool
+
+
+async def log_whitelist_attempt(
+    discord_user: discord.abc.User,
+    roblox_user_id: str,
+    roblox_username: str | None,
+    success: bool,
+):
+    if bot.db_pool is None:
+        log.warning("DB pool not ready, skipping log_whitelist_attempt")
+        return
+    try:
+        async with bot.db_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO whitelist_attempts
+                        (discord_user_id, discord_username, roblox_user_id, roblox_username, success)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (discord_user.id, str(discord_user), roblox_user_id, roblox_username, success),
+                )
+    except Exception as e:
+        log.exception("Failed to log whitelist attempt: %s", e)
+
+
+async def log_whitelist_action(
+    action: str,
+    target: discord.abc.User,
+    actor: discord.abc.User,
+    roblox_user_id: str | None = None,
+):
+    if bot.db_pool is None:
+        log.warning("DB pool not ready, skipping log_whitelist_action")
+        return
+    try:
+        async with bot.db_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO whitelist_actions
+                        (action, target_discord_id, target_username,
+                         actor_discord_id, actor_username, roblox_user_id)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (action, target.id, str(target), actor.id, str(actor), roblox_user_id),
+                )
+    except Exception as e:
+        log.exception("Failed to log whitelist action: %s", e)
+
+
+# ---------- Helpers ----------
 
 async def roblox_user_exists(user_id: str) -> tuple[bool, str | None]:
-    """Check Roblox's public API to see if a user ID corresponds to a real account.
-    Returns (exists, username_or_none)."""
     url = f"https://users.roblox.com/v1/users/{user_id}"
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                # Roblox returns isBanned field too; still counts as "real" account
                 return True, data.get("name")
             return False, None
 
 
 def is_staff(member: discord.Member) -> bool:
-    """True if member has the configured admin role, or Manage Roles / Administrator perms."""
     if member.guild_permissions.administrator or member.guild_permissions.manage_roles:
         return True
     if ADMIN_ROLE_ID is not None:
@@ -58,16 +158,34 @@ def is_staff(member: discord.Member) -> bool:
     return False
 
 
+# ---------- Events ----------
+
 @bot.event
 async def on_ready():
+    if bot.db_pool is None:
+        try:
+            bot.db_pool = await init_db_pool()
+        except Exception as e:
+            log.exception("Failed to connect to MySQL: %s", e)
+
     try:
         guild = discord.Object(id=GUILD_ID)
         synced = await bot.tree.sync(guild=guild)
         log.info(f"Synced {len(synced)} command(s) to guild {GUILD_ID}")
     except Exception as e:
         log.exception("Failed to sync commands: %s", e)
+
     log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
+
+@bot.event
+async def on_close():
+    if bot.db_pool is not None:
+        bot.db_pool.close()
+        await bot.db_pool.wait_closed()
+
+
+# ---------- Commands ----------
 
 @bot.tree.command(
     name="whitelist",
@@ -96,13 +214,13 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
         return
 
     if not exists:
+        await log_whitelist_attempt(interaction.user, roblox_user_id, None, success=False)
         await interaction.followup.send(
             f"❌ No Roblox account found with ID `{roblox_user_id}`. Double-check the ID and try again.",
             ephemeral=True,
         )
         return
 
-    # Grant the whitelist role
     guild = interaction.guild
     role = guild.get_role(WHITELIST_ROLE_ID)
     if role is None:
@@ -116,11 +234,15 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
     try:
         await member.add_roles(role, reason=f"Whitelisted via Roblox ID {roblox_user_id}")
     except discord.Forbidden:
+        await log_whitelist_attempt(interaction.user, roblox_user_id, username, success=False)
         await interaction.followup.send(
-            "⚠️ I don't have permission to give you that role. Contact an admin (my role must be above the whitelist role).",
+            "⚠️ I don't have permission to give you that role. Contact an admin.",
             ephemeral=True,
         )
         return
+
+    await log_whitelist_attempt(interaction.user, roblox_user_id, username, success=True)
+    await log_whitelist_action("whitelist", target=member, actor=member, roblox_user_id=roblox_user_id)
 
     await interaction.followup.send(
         f"✅ Verified! Roblox account **{username}** (`{roblox_user_id}`) is real. "
@@ -184,6 +306,8 @@ async def unwhitelist(interaction: discord.Interaction):
         )
         return
 
+    await log_whitelist_action("unwhitelist", target=member, actor=member)
+
     await interaction.response.send_message(
         "✅ You've been unwhitelisted and no longer have access to the channel.",
         ephemeral=True,
@@ -222,11 +346,12 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
         await member.remove_roles(role, reason=f"Force-unwhitelisted by {interaction.user}")
     except discord.Forbidden:
         await interaction.response.send_message(
-            "⚠️ I don't have permission to remove that role from that member "
-            "(check my role is above the whitelist role).",
+            "⚠️ I don't have permission to remove that role from that member.",
             ephemeral=True,
         )
         return
+
+    await log_whitelist_action("forceunwhitelist", target=member, actor=interaction.user)
 
     await interaction.response.send_message(
         f"✅ {member.mention} has been forcefully unwhitelisted.", ephemeral=True
@@ -246,7 +371,6 @@ async def say(interaction: discord.Interaction, message: str):
         )
         return
 
-    # Confirm privately first, then post publicly, so it's not silently anonymous to the requester
     await interaction.response.send_message("✅ Sent.", ephemeral=True)
     await interaction.channel.send(message)
 
@@ -264,7 +388,7 @@ async def imagetogif(interaction: discord.Interaction, image: discord.Attachment
         await interaction.followup.send("❌ That attachment isn't an image.", ephemeral=True)
         return
 
-    MAX_SIZE = 8 * 1024 * 1024  # 8MB safety limit
+    MAX_SIZE = 8 * 1024 * 1024
     if image.size > MAX_SIZE:
         await interaction.followup.send(
             "❌ That image is too large to convert (max 8MB).", ephemeral=True
@@ -277,7 +401,6 @@ async def imagetogif(interaction: discord.Interaction, image: discord.Attachment
 
         output_buffer = io.BytesIO()
         if getattr(source, "is_animated", False):
-            # Already an animated image (e.g. animated webp) -> re-encode all frames as GIF
             frames = [frame.convert("RGBA") for frame in ImageSequence.Iterator(source)]
             frames[0].save(
                 output_buffer,
@@ -288,7 +411,6 @@ async def imagetogif(interaction: discord.Interaction, image: discord.Attachment
                 duration=source.info.get("duration", 100),
             )
         else:
-            # Static image -> single-frame looping GIF
             source.convert("RGBA").save(output_buffer, format="GIF")
 
         output_buffer.seek(0)
