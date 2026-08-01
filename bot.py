@@ -3,6 +3,10 @@ Discord Roblox Whitelist Bot
 -----------------------------
 /whitelist <roblox_user_id>  -> verifies the ID is a real Roblox account,
 then grants the user a role that gives access to a specific channel.
+
+Every command invocation is also logged as a plain-text line to a
+Supabase table (see the "command_logs" table + SUPABASE_URL / SUPABASE_KEY
+env vars below).
 """
 
 import io
@@ -33,6 +37,12 @@ MYSQL_USER = os.environ["MYSQL_USER"]
 MYSQL_PASSWORD = os.environ["MYSQL_PASSWORD"]
 MYSQL_DATABASE = os.environ["MYSQL_DATABASE"]
 # ------------------------------------
+
+# ---------- Supabase (plain-text command logging) ----------
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]  # service_role key (server-side only!)
+SUPABASE_LOG_TABLE = os.environ.get("SUPABASE_LOG_TABLE", "command_logs")
+# ------------------------------------------------------------
 
 intents = discord.Intents.default()
 intents.members = True
@@ -138,6 +148,34 @@ async def log_whitelist_action(
         log.exception("Failed to log whitelist action: %s", e)
 
 
+async def log_to_supabase(log_text: str):
+    """
+    Insert a single plain-text log line into the Supabase `command_logs` table.
+    This is a lightweight audit trail of every command run on the bot, separate
+    from the structured MySQL tables above.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_LOG_TABLE}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    payload = {"log_text": log_text}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status not in (200, 201, 204):
+                    body = await resp.text()
+                    log.warning("Supabase logging failed (%s): %s", resp.status, body)
+    except Exception as e:
+        log.exception("Error sending log to Supabase: %s", e)
+
+
+def fmt_user(user: discord.abc.User) -> str:
+    return f"{user} ({user.id})"
+
+
 # ---------- Helpers ----------
 
 async def roblox_user_exists(user_id: str) -> tuple[bool, str | None]:
@@ -197,6 +235,10 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
     await interaction.response.defer(ephemeral=True)
 
     if not roblox_user_id.isdigit():
+        await log_to_supabase(
+            f"/whitelist by {fmt_user(interaction.user)} - rejected: "
+            f"invalid roblox_user_id format '{roblox_user_id}'"
+        )
         await interaction.followup.send(
             "❌ That doesn't look like a valid Roblox User ID (must be numbers only).",
             ephemeral=True,
@@ -207,6 +249,10 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
         exists, username = await roblox_user_exists(roblox_user_id)
     except Exception as e:
         log.exception("Error contacting Roblox API: %s", e)
+        await log_to_supabase(
+            f"/whitelist by {fmt_user(interaction.user)} - error contacting Roblox API "
+            f"for roblox_user_id={roblox_user_id}: {e}"
+        )
         await interaction.followup.send(
             "⚠️ Couldn't reach Roblox's servers right now. Try again in a moment.",
             ephemeral=True,
@@ -215,6 +261,10 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
 
     if not exists:
         await log_whitelist_attempt(interaction.user, roblox_user_id, None, success=False)
+        await log_to_supabase(
+            f"/whitelist by {fmt_user(interaction.user)} - failed: "
+            f"no Roblox account found for roblox_user_id={roblox_user_id}"
+        )
         await interaction.followup.send(
             f"❌ No Roblox account found with ID `{roblox_user_id}`. Double-check the ID and try again.",
             ephemeral=True,
@@ -224,6 +274,9 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
     guild = interaction.guild
     role = guild.get_role(WHITELIST_ROLE_ID)
     if role is None:
+        await log_to_supabase(
+            f"/whitelist by {fmt_user(interaction.user)} - failed: whitelist role not configured"
+        )
         await interaction.followup.send(
             "⚠️ Whitelist role isn't configured correctly. Contact an admin.",
             ephemeral=True,
@@ -235,6 +288,10 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
         await member.add_roles(role, reason=f"Whitelisted via Roblox ID {roblox_user_id}")
     except discord.Forbidden:
         await log_whitelist_attempt(interaction.user, roblox_user_id, username, success=False)
+        await log_to_supabase(
+            f"/whitelist by {fmt_user(interaction.user)} - failed: "
+            f"missing permission to add whitelist role"
+        )
         await interaction.followup.send(
             "⚠️ I don't have permission to give you that role. Contact an admin.",
             ephemeral=True,
@@ -243,6 +300,10 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
 
     await log_whitelist_attempt(interaction.user, roblox_user_id, username, success=True)
     await log_whitelist_action("whitelist", target=member, actor=member, roblox_user_id=roblox_user_id)
+    await log_to_supabase(
+        f"/whitelist by {fmt_user(interaction.user)} - success: "
+        f"roblox_username={username} roblox_user_id={roblox_user_id}"
+    )
 
     await interaction.followup.send(
         f"✅ Verified! Roblox account **{username}** (`{roblox_user_id}`) is real. "
@@ -257,6 +318,8 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
     guild=discord.Object(id=GUILD_ID),
 )
 async def info(interaction: discord.Interaction):
+    await log_to_supabase(f"/info by {fmt_user(interaction.user)}")
+
     uptime_seconds = int(time.time() - BOT_START_TIME)
     hours, remainder = divmod(uptime_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -284,6 +347,9 @@ async def unwhitelist(interaction: discord.Interaction):
     guild = interaction.guild
     role = guild.get_role(WHITELIST_ROLE_ID)
     if role is None:
+        await log_to_supabase(
+            f"/unwhitelist by {fmt_user(interaction.user)} - failed: whitelist role not configured"
+        )
         await interaction.response.send_message(
             "⚠️ Whitelist role isn't configured correctly. Contact an admin.",
             ephemeral=True,
@@ -292,6 +358,9 @@ async def unwhitelist(interaction: discord.Interaction):
 
     member = interaction.user
     if role not in member.roles:
+        await log_to_supabase(
+            f"/unwhitelist by {fmt_user(interaction.user)} - no-op: user was not whitelisted"
+        )
         await interaction.response.send_message(
             "ℹ️ You don't currently have whitelist access.", ephemeral=True
         )
@@ -300,6 +369,10 @@ async def unwhitelist(interaction: discord.Interaction):
     try:
         await member.remove_roles(role, reason="Self-unwhitelisted")
     except discord.Forbidden:
+        await log_to_supabase(
+            f"/unwhitelist by {fmt_user(interaction.user)} - failed: "
+            f"missing permission to remove whitelist role"
+        )
         await interaction.response.send_message(
             "⚠️ I don't have permission to remove that role. Contact an admin.",
             ephemeral=True,
@@ -307,6 +380,7 @@ async def unwhitelist(interaction: discord.Interaction):
         return
 
     await log_whitelist_action("unwhitelist", target=member, actor=member)
+    await log_to_supabase(f"/unwhitelist by {fmt_user(interaction.user)} - success")
 
     await interaction.response.send_message(
         "✅ You've been unwhitelisted and no longer have access to the channel.",
@@ -322,6 +396,10 @@ async def unwhitelist(interaction: discord.Interaction):
 @app_commands.describe(member="The member to unwhitelist")
 async def forceunwhitelist(interaction: discord.Interaction, member: discord.Member):
     if not is_staff(interaction.user):
+        await log_to_supabase(
+            f"/forceunwhitelist by {fmt_user(interaction.user)} - denied: "
+            f"not staff (target={fmt_user(member)})"
+        )
         await interaction.response.send_message(
             "❌ You don't have permission to use this command.", ephemeral=True
         )
@@ -330,6 +408,10 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
     guild = interaction.guild
     role = guild.get_role(WHITELIST_ROLE_ID)
     if role is None:
+        await log_to_supabase(
+            f"/forceunwhitelist by {fmt_user(interaction.user)} - failed: "
+            f"whitelist role not configured (target={fmt_user(member)})"
+        )
         await interaction.response.send_message(
             "⚠️ Whitelist role isn't configured correctly. Contact an admin.",
             ephemeral=True,
@@ -337,6 +419,10 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
         return
 
     if role not in member.roles:
+        await log_to_supabase(
+            f"/forceunwhitelist by {fmt_user(interaction.user)} - no-op: "
+            f"target {fmt_user(member)} was not whitelisted"
+        )
         await interaction.response.send_message(
             f"ℹ️ {member.mention} doesn't currently have whitelist access.", ephemeral=True
         )
@@ -345,6 +431,10 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
     try:
         await member.remove_roles(role, reason=f"Force-unwhitelisted by {interaction.user}")
     except discord.Forbidden:
+        await log_to_supabase(
+            f"/forceunwhitelist by {fmt_user(interaction.user)} - failed: "
+            f"missing permission to remove role from target {fmt_user(member)}"
+        )
         await interaction.response.send_message(
             "⚠️ I don't have permission to remove that role from that member.",
             ephemeral=True,
@@ -352,6 +442,10 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
         return
 
     await log_whitelist_action("forceunwhitelist", target=member, actor=interaction.user)
+    await log_to_supabase(
+        f"/forceunwhitelist by {fmt_user(interaction.user)} - success: "
+        f"target={fmt_user(member)}"
+    )
 
     await interaction.response.send_message(
         f"✅ {member.mention} has been forcefully unwhitelisted.", ephemeral=True
@@ -366,10 +460,17 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
 @app_commands.describe(message="What the bot should say")
 async def say(interaction: discord.Interaction, message: str):
     if not is_staff(interaction.user):
+        await log_to_supabase(
+            f"/say by {fmt_user(interaction.user)} - denied: not staff"
+        )
         await interaction.response.send_message(
             "❌ You don't have permission to use this command.", ephemeral=True
         )
         return
+
+    await log_to_supabase(
+        f"/say by {fmt_user(interaction.user)} in #{interaction.channel} - message: {message}"
+    )
 
     await interaction.response.send_message("✅ Sent.", ephemeral=True)
     await interaction.channel.send(message)
@@ -385,11 +486,19 @@ async def imagetogif(interaction: discord.Interaction, image: discord.Attachment
     await interaction.response.defer()
 
     if not (image.content_type and image.content_type.startswith("image/")):
+        await log_to_supabase(
+            f"/imagetogif by {fmt_user(interaction.user)} - rejected: "
+            f"attachment '{image.filename}' is not an image"
+        )
         await interaction.followup.send("❌ That attachment isn't an image.", ephemeral=True)
         return
 
     MAX_SIZE = 8 * 1024 * 1024
     if image.size > MAX_SIZE:
+        await log_to_supabase(
+            f"/imagetogif by {fmt_user(interaction.user)} - rejected: "
+            f"'{image.filename}' too large ({image.size} bytes)"
+        )
         await interaction.followup.send(
             "❌ That image is too large to convert (max 8MB).", ephemeral=True
         )
@@ -416,12 +525,20 @@ async def imagetogif(interaction: discord.Interaction, image: discord.Attachment
         output_buffer.seek(0)
     except Exception as e:
         log.exception("Error converting image to GIF: %s", e)
+        await log_to_supabase(
+            f"/imagetogif by {fmt_user(interaction.user)} - error converting "
+            f"'{image.filename}': {e}"
+        )
         await interaction.followup.send(
             "⚠️ Something went wrong converting that image.", ephemeral=True
         )
         return
 
     filename = os.path.splitext(image.filename)[0] + ".gif"
+    await log_to_supabase(
+        f"/imagetogif by {fmt_user(interaction.user)} - success: "
+        f"converted '{image.filename}' -> '{filename}'"
+    )
     await interaction.followup.send(
         content="✅ Here's your GIF:",
         file=discord.File(fp=output_buffer, filename=filename),
