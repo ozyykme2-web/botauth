@@ -174,6 +174,19 @@ def make_hwid(user_id: int) -> str:
     return hashlib.sha256(f"discord-{user_id}".encode()).hexdigest()
 
 
+async def set_logged_in(user_id: int, key: str):
+    bot.logged_in_users[str(user_id)] = key
+    await jsonbin_save()
+
+async def set_logged_out(user_id: int):
+    if str(user_id) in bot.logged_in_users:
+        del bot.logged_in_users[str(user_id)]
+        await jsonbin_save()
+
+def is_logged_in(user_id: int) -> bool:
+    return str(user_id) in bot.logged_in_users
+
+
 # ---------- Helpers ----------
 
 async def roblox_user_exists(user_id: str) -> tuple[bool, str | None]:
