@@ -82,57 +82,41 @@ def fmt_user(user: discord.abc.User) -> str:
     return f"{user} ({user.id})"
 
 
-# ---------- JSONBin sync ----------
+# ---------- Cloudflare Worker (replaces JSONBin) ----------
+CF_WORKER_URL = os.environ["CF_WORKER_URL"].rstrip("/")
+CF_API_SECRET = os.environ["CF_API_SECRET"]
 
 async def jsonbin_load() -> dict:
-    """Fetch the current bin contents. Returns {} if empty/unreachable."""
-    headers = {"X-Master-Key": JSONBIN_API_KEY}
+    """Fetch the current session list from Cloudflare. Returns {} on any failure."""
+    headers = {"Authorization": f"Bearer {CF_API_SECRET}"}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"{JSONBIN_BASE_URL}/latest", headers=headers) as resp:
+            async with session.get(f"{CF_WORKER_URL}/sessions", headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data.get("record", {}) or {}
+                    return data or {}
                 body = await resp.text()
-                log.warning("JSONBin load failed (%s): %s", resp.status, body)
+                log.warning("Cloudflare load failed (%s): %s", resp.status, body)
                 return {}
     except Exception as e:
-        log.exception("Error loading JSONBin: %s", e)
+        log.exception("Error loading from Cloudflare: %s", e)
         return {}
 
-
 async def jsonbin_save():
-    """Push the current in-memory logged_in_users dict to JSONBin."""
+    """Push the current in-memory logged_in_users dict to Cloudflare."""
     headers = {
-        "X-Master-Key": JSONBIN_API_KEY,
+        "Authorization": f"Bearer {CF_API_SECRET}",
         "Content-Type": "application/json",
     }
     payload = {"logged_in_users": bot.logged_in_users}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.put(JSONBIN_BASE_URL, headers=headers, json=payload) as resp:
-                if resp.status not in (200, 201):
+            async with session.put(f"{CF_WORKER_URL}/sessions", headers=headers, json=payload) as resp:
+                if resp.status not in (200, 201, 204):
                     body = await resp.text()
-                    log.warning("JSONBin save failed (%s): %s", resp.status, body)
+                    log.warning("Cloudflare save failed (%s): %s", resp.status, body)
     except Exception as e:
-        log.exception("Error saving JSONBin: %s", e)
-
-
-async def set_logged_in(user_id: int, key: str):
-    bot.logged_in_users[str(user_id)] = key
-    await jsonbin_save()
-
-
-async def set_logged_out(user_id: int):
-    if str(user_id) in bot.logged_in_users:
-        del bot.logged_in_users[str(user_id)]
-        await jsonbin_save()
-
-
-def is_logged_in(user_id: int) -> bool:
-    return str(user_id) in bot.logged_in_users
-
-
+        log.exception("Error saving to Cloudflare: %s", e)
 # ---------- KeyAuth ----------
 
 async def keyauth_check_key(license_key: str, hwid: str) -> tuple[bool, str]:
