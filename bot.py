@@ -1,16 +1,25 @@
 """
 Discord Roblox Whitelist Bot
 -----------------------------
-/whitelist <roblox_user_id>  -> verifies the ID is a real Roblox account,
-then grants the user a role that gives access to a specific channel.
+/login <license_key>         -> validates a KeyAuth license key. If valid,
+                                 marks the Discord user as "logged in" and
+                                 syncs the session list to JSONBin.io.
+/whitelist <roblox_user_id>  -> (requires login) verifies the ID is a real
+                                 Roblox account, then grants a role that
+                                 gives access to a specific channel.
 
-All logging (every command invocation, success, failure, and error) is sent
-as plain-text messages to a Discord webhook — no database required.
+All commands except /login and /info require the user to be logged in via
+KeyAuth first. The set of currently-logged-in Discord user IDs is kept in
+memory and mirrored to a JSONBin.io bin, so it survives restarts and can be
+inspected/edited externally if needed.
+
+All command activity is also logged as plain text to a Discord webhook.
 """
 
 import io
 import os
 import time
+import hashlib
 import logging
 import aiohttp
 import discord
@@ -30,25 +39,34 @@ BOT_START_TIME = time.time()
 
 # ---------- Logging webhook ----------
 LOG_WEBHOOK_URL = os.environ["LOG_WEBHOOK_URL"]
-# -------------------------------------
+
+# ---------- KeyAuth ----------
+KEYAUTH_NAME = os.environ["KEYAUTH_NAME"]                # your KeyAuth application name
+KEYAUTH_OWNERID = os.environ["KEYAUTH_OWNERID"]           # your KeyAuth owner ID
+KEYAUTH_APP_SECRET = os.environ["KEYAUTH_APP_SECRET"]     # your KeyAuth application secret
+KEYAUTH_VERSION = os.environ.get("KEYAUTH_VERSION", "1.0")
+KEYAUTH_API_URL = "https://keyauth.win/api/1.3/"          # KeyAuth's current API endpoint
+
+# ---------- JSONBin.io ----------
+JSONBIN_BIN_ID = os.environ["JSONBIN_BIN_ID"]
+JSONBIN_API_KEY = os.environ["JSONBIN_API_KEY"]           # your "X-Master-Key"
+JSONBIN_BASE_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
+# -----------------------------------------------------------
 
 intents = discord.Intents.default()
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# In-memory cache of logged-in Discord user IDs -> the key they used
+bot.logged_in_users: dict[str, str] = {}
+
 
 # ---------- Webhook logging ----------
 
 async def log_event(text: str):
-    """
-    Send a plain-text log line to the configured Discord webhook.
-    Used for every command invocation across the whole bot.
-    """
-    # Discord message limit is 2000 chars; keep a safety margin.
     if len(text) > 1900:
         text = text[:1900] + "... [truncated]"
-
     payload = {"content": text}
     try:
         async with aiohttp.ClientSession() as session:
@@ -62,6 +80,114 @@ async def log_event(text: str):
 
 def fmt_user(user: discord.abc.User) -> str:
     return f"{user} ({user.id})"
+
+
+# ---------- JSONBin sync ----------
+
+async def jsonbin_load() -> dict:
+    """Fetch the current bin contents. Returns {} if empty/unreachable."""
+    headers = {"X-Master-Key": JSONBIN_API_KEY}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{JSONBIN_BASE_URL}/latest", headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("record", {}) or {}
+                body = await resp.text()
+                log.warning("JSONBin load failed (%s): %s", resp.status, body)
+                return {}
+    except Exception as e:
+        log.exception("Error loading JSONBin: %s", e)
+        return {}
+
+
+async def jsonbin_save():
+    """Push the current in-memory logged_in_users dict to JSONBin."""
+    headers = {
+        "X-Master-Key": JSONBIN_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {"logged_in_users": bot.logged_in_users}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.put(JSONBIN_BASE_URL, headers=headers, json=payload) as resp:
+                if resp.status not in (200, 201):
+                    body = await resp.text()
+                    log.warning("JSONBin save failed (%s): %s", resp.status, body)
+    except Exception as e:
+        log.exception("Error saving JSONBin: %s", e)
+
+
+async def set_logged_in(user_id: int, key: str):
+    bot.logged_in_users[str(user_id)] = key
+    await jsonbin_save()
+
+
+async def set_logged_out(user_id: int):
+    if str(user_id) in bot.logged_in_users:
+        del bot.logged_in_users[str(user_id)]
+        await jsonbin_save()
+
+
+def is_logged_in(user_id: int) -> bool:
+    return str(user_id) in bot.logged_in_users
+
+
+# ---------- KeyAuth ----------
+
+async def keyauth_check_key(license_key: str, hwid: str) -> tuple[bool, str]:
+    """
+    Validates a license key against KeyAuth. Performs init + license() as
+    KeyAuth's API requires an init/session step before checking a license.
+    Returns (is_valid, message).
+    """
+    async with aiohttp.ClientSession() as session:
+        init_payload = {
+            "type": "init",
+            "name": KEYAUTH_NAME,
+            "ownerid": KEYAUTH_OWNERID,
+            "ver": KEYAUTH_VERSION,
+            "hash": hashlib.sha256(KEYAUTH_APP_SECRET.encode()).hexdigest(),
+        }
+        try:
+            async with session.post(KEYAUTH_API_URL, data=init_payload) as resp:
+                init_data = await resp.json()
+        except Exception as e:
+            log.exception("KeyAuth init request failed: %s", e)
+            return False, "Could not reach KeyAuth right now."
+
+        if not init_data.get("success"):
+            return False, init_data.get("message", "KeyAuth session init failed.")
+
+        session_id = init_data.get("sessionid")
+
+        license_payload = {
+            "type": "license",
+            "key": license_key,
+            "hwid": hwid,
+            "sessionid": session_id,
+            "name": KEYAUTH_NAME,
+            "ownerid": KEYAUTH_OWNERID,
+        }
+        try:
+            async with session.post(KEYAUTH_API_URL, data=license_payload) as resp:
+                lic_data = await resp.json()
+        except Exception as e:
+            log.exception("KeyAuth license check failed: %s", e)
+            return False, "Could not reach KeyAuth right now."
+
+        if lic_data.get("success"):
+            return True, "Key is valid."
+        return False, lic_data.get("message", "Invalid key.")
+
+
+def make_hwid(user_id: int) -> str:
+    """
+    Discord bots have no real hardware to fingerprint, so we derive a stable
+    per-user pseudo-HWID from their Discord ID. This satisfies KeyAuth's
+    hwid-locking feature without needing a real machine identifier.
+    """
+    return hashlib.sha256(f"discord-{user_id}".encode()).hexdigest()
 
 
 # ---------- Helpers ----------
@@ -84,6 +210,30 @@ def is_staff(member: discord.Member) -> bool:
     return False
 
 
+async def require_login(interaction: discord.Interaction) -> bool:
+    """
+    Call at the top of any gated command. Sends a rejection message and
+    returns False if the user hasn't logged in via /login yet.
+    """
+    if is_logged_in(interaction.user.id):
+        return True
+
+    await log_event(
+        f"🔒 {fmt_user(interaction.user)} tried /{interaction.command.name} without being logged in"
+    )
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            "🔒 You need to log in first. Use `/login <key>` with a valid KeyAuth key.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            "🔒 You need to log in first. Use `/login <key>` with a valid KeyAuth key.",
+            ephemeral=True,
+        )
+    return False
+
+
 # ---------- Events ----------
 
 @bot.event
@@ -95,8 +245,16 @@ async def on_ready():
     except Exception as e:
         log.exception("Failed to sync commands: %s", e)
 
+    # Restore session state from JSONBin on startup
+    record = await jsonbin_load()
+    bot.logged_in_users = record.get("logged_in_users", {}) or {}
+    log.info(f"Restored {len(bot.logged_in_users)} logged-in session(s) from JSONBin")
+
     log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    await log_event(f"🟢 Bot started up — logged in as {bot.user} (ID: {bot.user.id})")
+    await log_event(
+        f"🟢 Bot started up — logged in as {bot.user} (ID: {bot.user.id}); "
+        f"restored {len(bot.logged_in_users)} session(s) from JSONBin"
+    )
 
 
 @bot.event
@@ -118,6 +276,64 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # ---------- Commands ----------
 
 @bot.tree.command(
+    name="login",
+    description="Log in with your KeyAuth license key to unlock bot commands",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(key="Your KeyAuth license key")
+async def login(interaction: discord.Interaction, key: str):
+    await interaction.response.defer(ephemeral=True)
+
+    if is_logged_in(interaction.user.id):
+        await interaction.followup.send("ℹ️ You're already logged in.", ephemeral=True)
+        return
+
+    hwid = make_hwid(interaction.user.id)
+    try:
+        valid, message = await keyauth_check_key(key, hwid)
+    except Exception as e:
+        log.exception("KeyAuth check errored: %s", e)
+        await log_event(
+            f"/login by {fmt_user(interaction.user)} - error contacting KeyAuth: {e}"
+        )
+        await interaction.followup.send(
+            "⚠️ Couldn't reach KeyAuth right now. Try again in a moment.", ephemeral=True
+        )
+        return
+
+    if not valid:
+        await log_event(
+            f"/login by {fmt_user(interaction.user)} - rejected: {message}"
+        )
+        await interaction.followup.send(f"❌ Login failed: {message}", ephemeral=True)
+        return
+
+    await set_logged_in(interaction.user.id, key)
+    await log_event(f"/login by {fmt_user(interaction.user)} - success, session synced to JSONBin")
+
+    await interaction.followup.send(
+        "✅ Key verified! You're now logged in and can use the bot's commands.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="logout",
+    description="Log out and revoke your current session",
+    guild=discord.Object(id=GUILD_ID),
+)
+async def logout(interaction: discord.Interaction):
+    if not is_logged_in(interaction.user.id):
+        await interaction.response.send_message("ℹ️ You're not currently logged in.", ephemeral=True)
+        return
+
+    await set_logged_out(interaction.user.id)
+    await log_event(f"/logout by {fmt_user(interaction.user)} - session removed, JSONBin synced")
+
+    await interaction.response.send_message("✅ You've been logged out.", ephemeral=True)
+
+
+@bot.tree.command(
     name="whitelist",
     description="Whitelist yourself using your Roblox User ID",
     guild=discord.Object(id=GUILD_ID),
@@ -125,6 +341,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @app_commands.describe(roblox_user_id="Your numeric Roblox User ID")
 async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
     await interaction.response.defer(ephemeral=True)
+    if not await require_login(interaction):
+        return
 
     if not roblox_user_id.isdigit():
         await log_event(
@@ -217,9 +435,10 @@ async def info(interaction: discord.Interaction):
     embed.add_field(name="Uptime", value=uptime_str, inline=True)
     embed.add_field(name="Servers", value=str(len(bot.guilds)), inline=True)
     embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    embed.add_field(name="Logged-in sessions", value=str(len(bot.logged_in_users)), inline=True)
     embed.add_field(
         name="Commands",
-        value="/whitelist, /unwhitelist, /forceunwhitelist, /info, /say, /imagetogif",
+        value="/login, /logout, /whitelist, /unwhitelist, /forceunwhitelist, /info, /say, /imagetogif",
         inline=False,
     )
     embed.set_footer(text=f"Bot ID: {bot.user.id}")
@@ -232,6 +451,9 @@ async def info(interaction: discord.Interaction):
     guild=discord.Object(id=GUILD_ID),
 )
 async def unwhitelist(interaction: discord.Interaction):
+    if not await require_login(interaction):
+        return
+
     guild = interaction.guild
     role = guild.get_role(WHITELIST_ROLE_ID)
     if role is None:
@@ -267,10 +489,14 @@ async def unwhitelist(interaction: discord.Interaction):
         )
         return
 
-    await log_event(f"/unwhitelist by {fmt_user(interaction.user)} - success")
+    # Unwhitelisting also revokes their KeyAuth session + JSONBin entry
+    await set_logged_out(member.id)
+    await log_event(
+        f"/unwhitelist by {fmt_user(interaction.user)} - success (session revoked, JSONBin synced)"
+    )
 
     await interaction.response.send_message(
-        "✅ You've been unwhitelisted and no longer have access to the channel.",
+        "✅ You've been unwhitelisted, logged out, and no longer have access to the channel.",
         ephemeral=True,
     )
 
@@ -328,13 +554,14 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
         )
         return
 
+    await set_logged_out(member.id)
     await log_event(
         f"/forceunwhitelist by {fmt_user(interaction.user)} - success: "
-        f"target={fmt_user(member)}"
+        f"target={fmt_user(member)} (session revoked, JSONBin synced)"
     )
 
     await interaction.response.send_message(
-        f"✅ {member.mention} has been forcefully unwhitelisted.", ephemeral=True
+        f"✅ {member.mention} has been forcefully unwhitelisted and logged out.", ephemeral=True
     )
 
 
@@ -368,6 +595,8 @@ async def say(interaction: discord.Interaction, message: str):
 @app_commands.describe(image="The image to convert (png/jpg/webp/gif)")
 async def imagetogif(interaction: discord.Interaction, image: discord.Attachment):
     await interaction.response.defer()
+    if not await require_login(interaction):
+        return
 
     if not (image.content_type and image.content_type.startswith("image/")):
         await log_event(
