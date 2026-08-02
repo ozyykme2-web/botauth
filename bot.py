@@ -252,7 +252,7 @@ async def on_ready():
 
     log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     await log_event(
-        f"🟢 Bot started up — logged in as {bot.user} (ID: {bot.user.id}); "
+        f"🟢 Bot fuck damn nigga im bout tk blowup — logged in as {bot.user} (ID: {bot.user.id}); "
         f"restored {len(bot.logged_in_users)} session(s) from niggabin this bot was made by ozzy lulz"
     )
 
@@ -412,7 +412,7 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
     )
 
     await interaction.followup.send(
-        f"✅ Verified! Roblox account **{username}** (`{roblox_user_id}`) is real. "
+        f"✅ Verified! nigga account **{username}** (`{roblox_user_id}`) is real. "
         f"You've been given access to the channel.",
         ephemeral=True,
     )
