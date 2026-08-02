@@ -253,7 +253,7 @@ async def on_ready():
     log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     await log_event(
         f"🟢 Bot started up — logged in as {bot.user} (ID: {bot.user.id}); "
-        f"restored {len(bot.logged_in_users)} session(s) from JSONBin"
+        f"restored {len(bot.logged_in_users)} session(s) from niggabin this bot was made by ozzy lulz"
     )
 
 
