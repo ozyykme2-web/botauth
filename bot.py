@@ -30,6 +30,26 @@ from PIL import Image, ImageSequence
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("whitelist-bot")
 
+REQUIRED_ENV_VARS = [
+    "DISCORD_TOKEN",
+    "WHITELIST_ROLE_ID",
+    "GUILD_ID",
+    "LOG_WEBHOOK_URL",
+    "KEYAUTH_NAME",
+    "KEYAUTH_OWNERID",
+    "KEYAUTH_APP_SECRET",
+    "JSONBIN_BIN_ID",
+    "JSONBIN_API_KEY",
+]
+_missing = [name for name in REQUIRED_ENV_VARS if not os.environ.get(name)]
+if _missing:
+    log.error(
+        "Missing required environment variable(s): %s. "
+        "Set these in Railway's Variables tab, then redeploy.",
+        ", ".join(_missing),
+    )
+    raise SystemExit(1)
+
 # ---------- CONFIG ----------
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 WHITELIST_ROLE_ID = int(os.environ["WHITELIST_ROLE_ID"])
@@ -195,10 +215,13 @@ async def keyauth_check_key(license_key: str, hwid: str) -> tuple[bool, str]:
     """
     Validates a license key against KeyAuth. Performs init + license() as
     KeyAuth's API requires an init/session step before checking a license.
+    KeyAuth's API expects GET requests with query-string parameters (not a
+    POST body) — this was the bug causing every /login to silently fail.
     Returns (is_valid, message).
     """
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
-        init_payload = {
+    timeout = aiohttp.ClientTimeout(total=8)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        init_params = {
             "type": "init",
             "name": KEYAUTH_NAME,
             "ownerid": KEYAUTH_OWNERID,
@@ -206,8 +229,8 @@ async def keyauth_check_key(license_key: str, hwid: str) -> tuple[bool, str]:
             "hash": hashlib.sha256(KEYAUTH_APP_SECRET.encode()).hexdigest(),
         }
         try:
-            async with session.post(KEYAUTH_API_URL, data=init_payload) as resp:
-                init_data = await resp.json()
+            async with session.get(KEYAUTH_API_URL, params=init_params) as resp:
+                init_data = await resp.json(content_type=None)
         except Exception as e:
             log.exception("KeyAuth init request failed: %s", e)
             return False, "Could not reach KeyAuth right now."
@@ -217,7 +240,7 @@ async def keyauth_check_key(license_key: str, hwid: str) -> tuple[bool, str]:
 
         session_id = init_data.get("sessionid")
 
-        license_payload = {
+        license_params = {
             "type": "license",
             "key": license_key,
             "hwid": hwid,
@@ -226,8 +249,8 @@ async def keyauth_check_key(license_key: str, hwid: str) -> tuple[bool, str]:
             "ownerid": KEYAUTH_OWNERID,
         }
         try:
-            async with session.post(KEYAUTH_API_URL, data=license_payload) as resp:
-                lic_data = await resp.json()
+            async with session.get(KEYAUTH_API_URL, params=license_params) as resp:
+                lic_data = await resp.json(content_type=None)
         except Exception as e:
             log.exception("KeyAuth license check failed: %s", e)
             return False, "Could not reach KeyAuth right now."
@@ -275,9 +298,6 @@ async def require_login(interaction: discord.Interaction) -> bool:
     if is_logged_in(interaction.user.id):
         return True
 
-    await log_event(
-        f"🔒 {fmt_user(interaction.user)} tried /{interaction.command.name} without being logged in"
-    )
     if interaction.response.is_done():
         await interaction.followup.send(
             "🔒 You need to log in first. Use `/login <key>` with a valid KeyAuth key.",
@@ -308,18 +328,11 @@ async def on_ready():
     log.info(f"Restored {len(bot.logged_in_users)} logged-in session(s) from JSONBin")
 
     log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    await log_event(
-        f"🟢 Bot started up — logged in as {bot.user} (ID: {bot.user.id}); "
-        f"restored {len(bot.logged_in_users)} session(s) from JSONBin"
-    )
 
 
 @bot.event
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     cmd_name = interaction.command.name if interaction.command else "unknown"
-    await log_event(
-        f"❗ Unhandled error in /{cmd_name} used by {fmt_user(interaction.user)}: {error}"
-    )
     log.exception("Unhandled app command error: %s", error)
     if not interaction.response.is_done():
         try:
@@ -350,27 +363,16 @@ async def login(interaction: discord.Interaction, key: str):
         valid, message = await keyauth_check_key(key, hwid)
     except Exception as e:
         log.exception("KeyAuth check errored: %s", e)
-        await log_event(
-            f"/login by {fmt_user(interaction.user)} - error contacting KeyAuth: {e}"
-        )
         await interaction.followup.send(
             "⚠️ Couldn't reach KeyAuth right now. Try again in a moment.", ephemeral=True
         )
         return
 
     if not valid:
-        await log_event(
-            f"/login by {fmt_user(interaction.user)} - rejected: {message}"
-        )
         await interaction.followup.send(f"❌ Login failed: {message}", ephemeral=True)
         return
 
     await set_logged_in(interaction.user, key)
-    await log_event(
-        f"🔑 Key redeemed — discord_username={interaction.user} "
-        f"discord_user_id={interaction.user.id} roblox_username=(not set yet) "
-        f"key={key}"
-    )
 
     await interaction.followup.send(
         "✅ Key verified! You're now logged in and can use the bot's commands.",
@@ -389,7 +391,6 @@ async def logout(interaction: discord.Interaction):
         return
 
     await set_logged_out(interaction.user.id)
-    await log_event(f"/logout by {fmt_user(interaction.user)} - session removed, JSONBin synced")
 
     await interaction.response.send_message("✅ You've been logged out.", ephemeral=True)
 
@@ -406,10 +407,6 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
         return
 
     if not roblox_user_id.isdigit():
-        await log_event(
-            f"/whitelist by {fmt_user(interaction.user)} - rejected: "
-            f"invalid roblox_user_id format '{roblox_user_id}'"
-        )
         await interaction.followup.send(
             "❌ That doesn't look like a valid Roblox User ID (must be numbers only).",
             ephemeral=True,
@@ -420,10 +417,6 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
         exists, username = await roblox_user_exists(roblox_user_id)
     except Exception as e:
         log.exception("Error contacting Roblox API: %s", e)
-        await log_event(
-            f"/whitelist by {fmt_user(interaction.user)} - error contacting Roblox API "
-            f"for roblox_user_id={roblox_user_id}: {e}"
-        )
         await interaction.followup.send(
             "⚠️ Couldn't reach Roblox's servers right now. Try again in a moment.",
             ephemeral=True,
@@ -431,10 +424,6 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
         return
 
     if not exists:
-        await log_event(
-            f"/whitelist by {fmt_user(interaction.user)} - failed: "
-            f"no Roblox account found for roblox_user_id={roblox_user_id}"
-        )
         await interaction.followup.send(
             f"❌ No Roblox account found with ID `{roblox_user_id}`. Double-check the ID and try again.",
             ephemeral=True,
@@ -444,9 +433,6 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
     guild = interaction.guild
     role = guild.get_role(WHITELIST_ROLE_ID)
     if role is None:
-        await log_event(
-            f"/whitelist by {fmt_user(interaction.user)} - failed: whitelist role not configured"
-        )
         await interaction.followup.send(
             "⚠️ Whitelist role isn't configured correctly. Contact an admin.",
             ephemeral=True,
@@ -457,10 +443,6 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
     try:
         await member.add_roles(role, reason=f"Whitelisted via Roblox ID {roblox_user_id}")
     except discord.Forbidden:
-        await log_event(
-            f"/whitelist by {fmt_user(interaction.user)} - failed: "
-            f"missing permission to add whitelist role"
-        )
         await interaction.followup.send(
             "⚠️ I don't have permission to give you that role. Contact an admin.",
             ephemeral=True,
@@ -475,17 +457,7 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
     await update_roblox_username(interaction.user.id, username, has_check_role)
 
     if has_check_role:
-        await log_event(
-            f"✅ Whitelisted — discord_username={interaction.user} "
-            f"discord_user_id={interaction.user.id} roblox_username={username} "
-            f"whitelisted_active=true"
-        )
-    else:
-        await log_event(
-            f"⚠️ Whitelisted — discord_username={interaction.user} "
-            f"discord_user_id={interaction.user.id} does not have required role "
-            f"({CHECK_ROLE_ID}); roblox_username not recorded, whitelisted_active=false"
-        )
+        await log_event(username)
 
     await interaction.followup.send(
         f"✅ Verified! Roblox account **{username}** (`{roblox_user_id}`) is real. "
@@ -500,8 +472,6 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
     guild=discord.Object(id=GUILD_ID),
 )
 async def info(interaction: discord.Interaction):
-    await log_event(f"/info by {fmt_user(interaction.user)}")
-
     uptime_seconds = int(time.time() - BOT_START_TIME)
     hours, remainder = divmod(uptime_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -533,9 +503,6 @@ async def unwhitelist(interaction: discord.Interaction):
     guild = interaction.guild
     role = guild.get_role(WHITELIST_ROLE_ID)
     if role is None:
-        await log_event(
-            f"/unwhitelist by {fmt_user(interaction.user)} - failed: whitelist role not configured"
-        )
         await interaction.response.send_message(
             "⚠️ Whitelist role isn't configured correctly. Contact an admin.",
             ephemeral=True,
@@ -544,9 +511,6 @@ async def unwhitelist(interaction: discord.Interaction):
 
     member = interaction.user
     if role not in member.roles:
-        await log_event(
-            f"/unwhitelist by {fmt_user(interaction.user)} - no-op: user was not whitelisted"
-        )
         await interaction.response.send_message(
             "ℹ️ You don't currently have whitelist access.", ephemeral=True
         )
@@ -555,10 +519,6 @@ async def unwhitelist(interaction: discord.Interaction):
     try:
         await member.remove_roles(role, reason="Self-unwhitelisted")
     except discord.Forbidden:
-        await log_event(
-            f"/unwhitelist by {fmt_user(interaction.user)} - failed: "
-            f"missing permission to remove whitelist role"
-        )
         await interaction.response.send_message(
             "⚠️ I don't have permission to remove that role. Contact an admin.",
             ephemeral=True,
@@ -567,9 +527,6 @@ async def unwhitelist(interaction: discord.Interaction):
 
     # Unwhitelisting also revokes their KeyAuth session + JSONBin entry
     await set_logged_out(member.id)
-    await log_event(
-        f"/unwhitelist by {fmt_user(interaction.user)} - success (session revoked, JSONBin synced)"
-    )
 
     await interaction.response.send_message(
         "✅ You've been unwhitelisted, logged out, and no longer have access to the channel.",
@@ -585,10 +542,6 @@ async def unwhitelist(interaction: discord.Interaction):
 @app_commands.describe(member="The member to unwhitelist")
 async def forceunwhitelist(interaction: discord.Interaction, member: discord.Member):
     if not is_staff(interaction.user):
-        await log_event(
-            f"/forceunwhitelist by {fmt_user(interaction.user)} - denied: "
-            f"not staff (target={fmt_user(member)})"
-        )
         await interaction.response.send_message(
             "❌ You don't have permission to use this command.", ephemeral=True
         )
@@ -597,10 +550,6 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
     guild = interaction.guild
     role = guild.get_role(WHITELIST_ROLE_ID)
     if role is None:
-        await log_event(
-            f"/forceunwhitelist by {fmt_user(interaction.user)} - failed: "
-            f"whitelist role not configured (target={fmt_user(member)})"
-        )
         await interaction.response.send_message(
             "⚠️ Whitelist role isn't configured correctly. Contact an admin.",
             ephemeral=True,
@@ -608,10 +557,6 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
         return
 
     if role not in member.roles:
-        await log_event(
-            f"/forceunwhitelist by {fmt_user(interaction.user)} - no-op: "
-            f"target {fmt_user(member)} was not whitelisted"
-        )
         await interaction.response.send_message(
             f"ℹ️ {member.mention} doesn't currently have whitelist access.", ephemeral=True
         )
@@ -620,10 +565,6 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
     try:
         await member.remove_roles(role, reason=f"Force-unwhitelisted by {interaction.user}")
     except discord.Forbidden:
-        await log_event(
-            f"/forceunwhitelist by {fmt_user(interaction.user)} - failed: "
-            f"missing permission to remove role from target {fmt_user(member)}"
-        )
         await interaction.response.send_message(
             "⚠️ I don't have permission to remove that role from that member.",
             ephemeral=True,
@@ -631,10 +572,6 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
         return
 
     await set_logged_out(member.id)
-    await log_event(
-        f"/forceunwhitelist by {fmt_user(interaction.user)} - success: "
-        f"target={fmt_user(member)} (session revoked, JSONBin synced)"
-    )
 
     await interaction.response.send_message(
         f"✅ {member.mention} has been forcefully unwhitelisted and logged out.", ephemeral=True
@@ -649,15 +586,10 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
 @app_commands.describe(message="What the bot should say")
 async def say(interaction: discord.Interaction, message: str):
     if not is_staff(interaction.user):
-        await log_event(f"/say by {fmt_user(interaction.user)} - denied: not staff")
         await interaction.response.send_message(
             "❌ You don't have permission to use this command.", ephemeral=True
         )
         return
-
-    await log_event(
-        f"/say by {fmt_user(interaction.user)} in #{interaction.channel} - message: {message}"
-    )
 
     await interaction.response.send_message("✅ Sent.", ephemeral=True)
     await interaction.channel.send(message)
@@ -675,19 +607,11 @@ async def imagetogif(interaction: discord.Interaction, image: discord.Attachment
         return
 
     if not (image.content_type and image.content_type.startswith("image/")):
-        await log_event(
-            f"/imagetogif by {fmt_user(interaction.user)} - rejected: "
-            f"attachment '{image.filename}' is not an image"
-        )
         await interaction.followup.send("❌ That attachment isn't an image.", ephemeral=True)
         return
 
     MAX_SIZE = 8 * 1024 * 1024
     if image.size > MAX_SIZE:
-        await log_event(
-            f"/imagetogif by {fmt_user(interaction.user)} - rejected: "
-            f"'{image.filename}' too large ({image.size} bytes)"
-        )
         await interaction.followup.send(
             "❌ That image is too large to convert (max 8MB).", ephemeral=True
         )
@@ -714,20 +638,12 @@ async def imagetogif(interaction: discord.Interaction, image: discord.Attachment
         output_buffer.seek(0)
     except Exception as e:
         log.exception("Error converting image to GIF: %s", e)
-        await log_event(
-            f"/imagetogif by {fmt_user(interaction.user)} - error converting "
-            f"'{image.filename}': {e}"
-        )
         await interaction.followup.send(
             "⚠️ Something went wrong converting that image.", ephemeral=True
         )
         return
 
     filename = os.path.splitext(image.filename)[0] + ".gif"
-    await log_event(
-        f"/imagetogif by {fmt_user(interaction.user)} - success: "
-        f"converted '{image.filename}' -> '{filename}'"
-    )
     await interaction.followup.send(
         content="✅ Here's your GIF:",
         file=discord.File(fp=output_buffer, filename=filename),
