@@ -35,6 +35,8 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 WHITELIST_ROLE_ID = int(os.environ["WHITELIST_ROLE_ID"])
 GUILD_ID = int(os.environ["GUILD_ID"])
 ADMIN_ROLE_ID = int(os.environ["ADMIN_ROLE_ID"]) if os.environ.get("ADMIN_ROLE_ID") else None
+# Role that must be present before we log/record a user's Roblox username
+CHECK_ROLE_ID = int(os.environ.get("CHECK_ROLE_ID", "1532682936996860024"))
 BOT_START_TIME = time.time()
 
 # ---------- Logging webhook ----------
@@ -150,17 +152,24 @@ async def set_logged_in(
                 "discord_username": str(user),
                 "discord_user_id": str(user.id),
                 "roblox_username": roblox_username,
+                "whitelisted_active": False,
                 "key": key,
             }
         )
     await jsonbin_save()
 
 
-async def update_roblox_username(user_id: int, roblox_username: str):
-    """Update the roblox_username on an existing session record (e.g. after /whitelist)."""
+async def update_roblox_username(user_id: int, roblox_username: str, has_check_role: bool):
+    """
+    Update the whitelist status on an existing session record.
+    The Roblox username is only recorded if the member currently has
+    CHECK_ROLE_ID; `whitelisted_active` always reflects that role check.
+    """
     rec = _find_record(user_id)
     if rec is not None:
-        rec["roblox_username"] = roblox_username
+        rec["whitelisted_active"] = has_check_role
+        if has_check_role:
+            rec["roblox_username"] = roblox_username
         await jsonbin_save()
 
 
@@ -454,14 +463,25 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
         )
         return
 
-    # Record the verified Roblox username against their session in JSONBin
-    await update_roblox_username(interaction.user.id, username)
+    # Check whether the member actually holds the required role before we
+    # log or store their Roblox username; whitelisted_active always reflects
+    # this check regardless.
+    has_check_role = any(r.id == CHECK_ROLE_ID for r in member.roles)
 
-    await log_event(
-        f"✅ Whitelisted — discord_username={interaction.user} "
-        f"discord_user_id={interaction.user.id} roblox_username={username} "
-        f"roblox_user_id={roblox_user_id}"
-    )
+    await update_roblox_username(interaction.user.id, username, has_check_role)
+
+    if has_check_role:
+        await log_event(
+            f"✅ Whitelisted — discord_username={interaction.user} "
+            f"discord_user_id={interaction.user.id} roblox_username={username} "
+            f"whitelisted_active=true"
+        )
+    else:
+        await log_event(
+            f"⚠️ Whitelisted — discord_username={interaction.user} "
+            f"discord_user_id={interaction.user.id} does not have required role "
+            f"({CHECK_ROLE_ID}); roblox_username not recorded, whitelisted_active=false"
+        )
 
     await interaction.followup.send(
         f"✅ Verified! Roblox account **{username}** (`{roblox_user_id}`) is real. "
