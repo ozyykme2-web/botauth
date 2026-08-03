@@ -76,8 +76,9 @@ async def log_event(text: str):
     if len(text) > 1900:
         text = text[:1900] + "... [truncated]"
     payload = {"content": text}
+    timeout = aiohttp.ClientTimeout(total=8)
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(LOG_WEBHOOK_URL, json=payload) as resp:
                 if resp.status not in (200, 204):
                     body = await resp.text()
@@ -95,8 +96,9 @@ def fmt_user(user: discord.abc.User) -> str:
 async def jsonbin_load() -> dict:
     """Fetch the current bin contents. Returns {} if empty/unreachable."""
     headers = {"X-Master-Key": JSONBIN_API_KEY}
+    timeout = aiohttp.ClientTimeout(total=8)
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(f"{JSONBIN_BASE_URL}/latest", headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -116,8 +118,9 @@ async def jsonbin_save():
         "Content-Type": "application/json",
     }
     payload = {"logged_in_users": bot.logged_in_users}
+    timeout = aiohttp.ClientTimeout(total=8)
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.put(JSONBIN_BASE_URL, headers=headers, json=payload) as resp:
                 if resp.status not in (200, 201):
                     body = await resp.text()
@@ -194,7 +197,7 @@ async def keyauth_check_key(license_key: str, hwid: str) -> tuple[bool, str]:
     KeyAuth's API requires an init/session step before checking a license.
     Returns (is_valid, message).
     """
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
         init_payload = {
             "type": "init",
             "name": KEYAUTH_NAME,
@@ -247,7 +250,8 @@ def make_hwid(user_id: int) -> str:
 
 async def roblox_user_exists(user_id: str) -> tuple[bool, str | None]:
     url = f"https://users.roblox.com/v1/users/{user_id}"
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=8)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url) as resp:
             if resp.status == 200:
                 data = await resp.json()
