@@ -18,6 +18,7 @@ All command activity is also logged as plain text to a Discord webhook.
 
 import io
 import os
+import json
 import time
 import hashlib
 import logging
@@ -271,15 +272,24 @@ def make_hwid(user_id: int) -> str:
 
 # ---------- Helpers ----------
 
-async def roblox_user_exists(user_id: str) -> tuple[bool, str | None]:
-    url = f"https://users.roblox.com/v1/users/{user_id}"
+async def roblox_user_exists(username: str) -> tuple[bool, str | None, str | None]:
+    """
+    Looks up a Roblox account by username via Roblox's usernames API.
+    Returns (exists, canonical_username, user_id).
+    """
+    url = "https://users.roblox.com/v1/usernames/users"
     timeout = aiohttp.ClientTimeout(total=8)
+    payload = {"usernames": [username], "excludeBannedUsers": False}
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return True, data.get("name")
-            return False, None
+        async with session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                return False, None, None
+            data = await resp.json()
+            results = data.get("data") or []
+            if not results:
+                return False, None, None
+            match = results[0]
+            return True, match.get("name"), str(match.get("id"))
 
 
 def is_staff(member: discord.Member) -> bool:
@@ -397,24 +407,17 @@ async def logout(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="whitelist",
-    description="Whitelist yourself using your Roblox User ID",
+    description="Whitelist yourself using your Roblox username",
     guild=discord.Object(id=GUILD_ID),
 )
-@app_commands.describe(roblox_user_id="Your numeric Roblox User ID")
-async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
+@app_commands.describe(roblox_username="Your Roblox username")
+async def whitelist(interaction: discord.Interaction, roblox_username: str):
     await interaction.response.defer(ephemeral=True)
     if not await require_login(interaction):
         return
 
-    if not roblox_user_id.isdigit():
-        await interaction.followup.send(
-            "❌ That doesn't look like a valid Roblox User ID (must be numbers only).",
-            ephemeral=True,
-        )
-        return
-
     try:
-        exists, username = await roblox_user_exists(roblox_user_id)
+        exists, username, roblox_user_id = await roblox_user_exists(roblox_username)
     except Exception as e:
         log.exception("Error contacting Roblox API: %s", e)
         await interaction.followup.send(
@@ -425,7 +428,8 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
 
     if not exists:
         await interaction.followup.send(
-            f"❌ No Roblox account found with ID `{roblox_user_id}`. Double-check the ID and try again.",
+            f"❌ No Roblox account found with username `{roblox_username}`. "
+            f"Double-check the spelling and try again.",
             ephemeral=True,
         )
         return
@@ -441,7 +445,7 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
 
     member = interaction.user
     try:
-        await member.add_roles(role, reason=f"Whitelisted via Roblox ID {roblox_user_id}")
+        await member.add_roles(role, reason=f"Whitelisted via Roblox username {username}")
     except discord.Forbidden:
         await interaction.followup.send(
             "⚠️ I don't have permission to give you that role. Contact an admin.",
@@ -457,10 +461,10 @@ async def whitelist(interaction: discord.Interaction, roblox_user_id: str):
     await update_roblox_username(interaction.user.id, username, has_check_role)
 
     if has_check_role:
-        await log_event(username)
+        await log_event(json.dumps({"roblox_username": username}))
 
     await interaction.followup.send(
-        f"✅ Verified! Roblox account **{username}** (`{roblox_user_id}`) is real. "
+        f"✅ Verified! Roblox account **{username}** (ID `{roblox_user_id}`) is real. "
         f"You've been given access to the channel.",
         ephemeral=True,
     )
