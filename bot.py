@@ -1,21 +1,14 @@
 """
 Discord Roblox Whitelist Bot
 -----------------------------
-/login <license_key>         -> validates a KeyAuth license key. If valid,
-                                 marks the Discord user as "logged in" and
-                                 syncs the session list to JSONBin.io.
-/whitelist <roblox_user_id>  -> (requires login) verifies the ID is a real
-                                 Roblox account, then grants a role that
-                                 gives access to a specific channel.
-
+/login <license_key> -> validates a KeyAuth license key. If valid,
+                                 marks the Discord user as "logged in".
+/whitelist <roblox_username> -> (requires login) verifies the username is a real
+                                 Roblox account, then grants a role.
 All commands except /login and /info require the user to be logged in via
-KeyAuth first. The set of currently-logged-in Discord user IDs is kept in
-memory and mirrored to a JSONBin.io bin, so it survives restarts and can be
-inspected/edited externally if needed.
-
-All command activity is also logged as plain text to a Discord webhook.
+KeyAuth first. Login sessions are in-memory only.
+Whitelisted Roblox usernames are mirrored to JSONBin.io.
 """
-
 import io
 import os
 import json
@@ -51,47 +44,31 @@ if _missing:
     )
     raise SystemExit(1)
 
-# ---------- CONFIG ----------
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 WHITELIST_ROLE_ID = int(os.environ["WHITELIST_ROLE_ID"])
 GUILD_ID = int(os.environ["GUILD_ID"])
 ADMIN_ROLE_ID = int(os.environ["ADMIN_ROLE_ID"]) if os.environ.get("ADMIN_ROLE_ID") else None
-# Role that must be present before we log/record a user's Roblox username
 CHECK_ROLE_ID = int(os.environ.get("CHECK_ROLE_ID", "1532682936996860024"))
 BOT_START_TIME = time.time()
 
-# ---------- Logging webhook ----------
 LOG_WEBHOOK_URL = os.environ["LOG_WEBHOOK_URL"]
 
-# ---------- KeyAuth ----------
-KEYAUTH_NAME = os.environ["KEYAUTH_NAME"]                # your KeyAuth application name
-KEYAUTH_OWNERID = os.environ["KEYAUTH_OWNERID"]           # your KeyAuth owner ID
-KEYAUTH_APP_SECRET = os.environ["KEYAUTH_APP_SECRET"]     # your KeyAuth application secret
+KEYAUTH_NAME = os.environ["KEYAUTH_NAME"]
+KEYAUTH_OWNERID = os.environ["KEYAUTH_OWNERID"]
+KEYAUTH_APP_SECRET = os.environ["KEYAUTH_APP_SECRET"]
 KEYAUTH_VERSION = os.environ.get("KEYAUTH_VERSION", "1.0")
-KEYAUTH_API_URL = "https://keyauth.win/api/1.3/"          # KeyAuth's current API endpoint
+KEYAUTH_API_URL = "https://keyauth.win/api/1.3/"
 
-# ---------- JSONBin.io ----------
 JSONBIN_BIN_ID = os.environ["JSONBIN_BIN_ID"]
-JSONBIN_API_KEY = os.environ["JSONBIN_API_KEY"]           # your "X-Master-Key"
+JSONBIN_API_KEY = os.environ["JSONBIN_API_KEY"]
 JSONBIN_BASE_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
-# -----------------------------------------------------------
 
 intents = discord.Intents.default()
 intents.members = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# In-memory only — who is currently logged in via /login. NOT synced to
-# JSONBin (JSONBin holds only whitelisted Roblox usernames, nothing else).
-# Maps discord_user_id (str) -> {"key": ..., "roblox_username": ... or None}
 bot.logged_in_users: dict[str, dict] = {}
-
-# The only thing persisted to JSONBin: a flat list of Roblox usernames that
-# currently have the required role.
 bot.roblox_usernames: list[str] = []
-
-
-# ---------- Webhook logging ----------
 
 async def log_event(text: str):
     if len(text) > 1900:
@@ -107,15 +84,10 @@ async def log_event(text: str):
     except Exception as e:
         log.exception("Error sending log to webhook: %s", e)
 
-
 def fmt_user(user: discord.abc.User) -> str:
     return f"{user} ({user.id})"
 
-
-# ---------- JSONBin sync (roblox usernames only) ----------
-
 async def jsonbin_load() -> dict:
-    """Fetch the current bin contents. Returns {} if empty/unreachable."""
     headers = {"X-Master-Key": JSONBIN_API_KEY}
     timeout = aiohttp.ClientTimeout(total=8)
     try:
@@ -123,7 +95,10 @@ async def jsonbin_load() -> dict:
             async with session.get(f"{JSONBIN_BASE_URL}/latest", headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data.get("record", {}) or {}
+                    record = data.get("record", {}) or {}
+                    if isinstance(record, dict):
+                        return record
+                    return {}
                 body = await resp.text()
                 log.warning("JSONBin load failed (%s): %s", resp.status, body)
                 return {}
@@ -131,9 +106,7 @@ async def jsonbin_load() -> dict:
         log.exception("Error loading JSONBin: %s", e)
         return {}
 
-
 async def jsonbin_save():
-    """Push the current in-memory roblox_usernames list to JSONBin — nothing else."""
     headers = {
         "X-Master-Key": JSONBIN_API_KEY,
         "Content-Type": "application/json",
@@ -149,66 +122,40 @@ async def jsonbin_save():
     except Exception as e:
         log.exception("Error saving JSONBin: %s", e)
 
-
 async def add_roblox_username(username: str):
     if username not in bot.roblox_usernames:
         bot.roblox_usernames.append(username)
         await jsonbin_save()
-
 
 async def remove_roblox_username(username: str | None):
     if username and username in bot.roblox_usernames:
         bot.roblox_usernames.remove(username)
         await jsonbin_save()
 
-
-# ---------- In-memory login sessions (not persisted) ----------
-
 def set_logged_in(user: discord.abc.User, key: str):
     bot.logged_in_users[str(user.id)] = {"key": key, "roblox_username": None}
-
 
 def set_logged_out(user_id: int):
     bot.logged_in_users.pop(str(user_id), None)
 
-
 def is_logged_in(user_id: int) -> bool:
     return str(user_id) in bot.logged_in_users
-
 
 def get_session_roblox_username(user_id: int) -> str | None:
     rec = bot.logged_in_users.get(str(user_id))
     return rec.get("roblox_username") if rec else None
 
-
 async def update_roblox_username(user_id: int, roblox_username: str, has_check_role: bool):
-    """
-    Record which Roblox username this Discord user last whitelisted (in
-    memory, for /unwhitelist to know what to remove later), and sync JSONBin
-    with just the plain list of currently-whitelisted Roblox usernames.
-    """
     rec = bot.logged_in_users.get(str(user_id))
     old_username = rec.get("roblox_username") if rec else None
-
     if rec is not None:
         rec["roblox_username"] = roblox_username if has_check_role else old_username
-
     if has_check_role:
         if old_username and old_username != roblox_username:
             await remove_roblox_username(old_username)
         await add_roblox_username(roblox_username)
 
-
-# ---------- KeyAuth ----------
-
 async def keyauth_check_key(license_key: str, hwid: str) -> tuple[bool, str]:
-    """
-    Validates a license key against KeyAuth. Performs init + license() as
-    KeyAuth's API requires an init/session step before checking a license.
-    KeyAuth's API expects GET requests with query-string parameters (not a
-    POST body) — this was the bug causing every /login to silently fail.
-    Returns (is_valid, message).
-    """
     timeout = aiohttp.ClientTimeout(total=8)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         init_params = {
@@ -224,12 +171,9 @@ async def keyauth_check_key(license_key: str, hwid: str) -> tuple[bool, str]:
         except Exception as e:
             log.exception("KeyAuth init request failed: %s", e)
             return False, "Could not reach KeyAuth right now."
-
         if not init_data.get("success"):
             return False, init_data.get("message", "KeyAuth session init failed.")
-
         session_id = init_data.get("sessionid")
-
         license_params = {
             "type": "license",
             "key": license_key,
@@ -244,28 +188,14 @@ async def keyauth_check_key(license_key: str, hwid: str) -> tuple[bool, str]:
         except Exception as e:
             log.exception("KeyAuth license check failed: %s", e)
             return False, "Could not reach KeyAuth right now."
-
         if lic_data.get("success"):
             return True, "Key is valid."
         return False, lic_data.get("message", "Invalid key.")
 
-
 def make_hwid(user_id: int) -> str:
-    """
-    Discord bots have no real hardware to fingerprint, so we derive a stable
-    per-user pseudo-HWID from their Discord ID. This satisfies KeyAuth's
-    hwid-locking feature without needing a real machine identifier.
-    """
     return hashlib.sha256(f"discord-{user_id}".encode()).hexdigest()
 
-
-# ---------- Helpers ----------
-
 async def roblox_user_exists(username: str) -> tuple[bool, str | None, str | None]:
-    """
-    Looks up a Roblox account by username via Roblox's usernames API.
-    Returns (exists, canonical_username, user_id).
-    """
     url = "https://users.roblox.com/v1/usernames/users"
     timeout = aiohttp.ClientTimeout(total=8)
     payload = {"usernames": [username], "excludeBannedUsers": False}
@@ -280,7 +210,6 @@ async def roblox_user_exists(username: str) -> tuple[bool, str | None, str | Non
             match = results[0]
             return True, match.get("name"), str(match.get("id"))
 
-
 def is_staff(member: discord.Member) -> bool:
     if member.guild_permissions.administrator or member.guild_permissions.manage_roles:
         return True
@@ -288,15 +217,9 @@ def is_staff(member: discord.Member) -> bool:
         return any(r.id == ADMIN_ROLE_ID for r in member.roles)
     return False
 
-
 async def require_login(interaction: discord.Interaction) -> bool:
-    """
-    Call at the top of any gated command. Sends a rejection message and
-    returns False if the user hasn't logged in via /login yet.
-    """
     if is_logged_in(interaction.user.id):
         return True
-
     if interaction.response.is_done():
         await interaction.followup.send(
             "🔒 You need to log in first. Use `/login <key>` with a valid KeyAuth key.",
@@ -309,9 +232,6 @@ async def require_login(interaction: discord.Interaction) -> bool:
         )
     return False
 
-
-# ---------- Events ----------
-
 @bot.event
 async def on_ready():
     try:
@@ -320,19 +240,14 @@ async def on_ready():
         log.info(f"Synced {len(synced)} command(s) to guild {GUILD_ID}")
     except Exception as e:
         log.exception("Failed to sync commands: %s", e)
-
-    # Restore the whitelisted Roblox usernames list from JSONBin on startup.
-    # Login sessions are in-memory only now and do NOT persist across restarts.
     record = await jsonbin_load()
-    bot.roblox_usernames = record.get("roblox_usernames", []) or []
+    usernames = record.get("roblox_usernames", []) if isinstance(record, dict) else []
+    bot.roblox_usernames = [u for u in usernames if isinstance(u, str)]
     log.info(f"Restored {len(bot.roblox_usernames)} roblox username(s) from JSONBin")
-
     log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-
 
 @bot.event
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    cmd_name = interaction.command.name if interaction.command else "unknown"
     log.exception("Unhandled app command error: %s", error)
     if not interaction.response.is_done():
         try:
@@ -342,9 +257,6 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         except Exception:
             pass
 
-
-# ---------- Commands ----------
-
 @bot.tree.command(
     name="login",
     description="Log in with your KeyAuth license key to unlock bot commands",
@@ -353,11 +265,9 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @app_commands.describe(key="Your KeyAuth license key")
 async def login(interaction: discord.Interaction, key: str):
     await interaction.response.defer(ephemeral=True)
-
     if is_logged_in(interaction.user.id):
         await interaction.followup.send("ℹ️ You're already logged in.", ephemeral=True)
         return
-
     hwid = make_hwid(interaction.user.id)
     try:
         valid, message = await keyauth_check_key(key, hwid)
@@ -367,18 +277,14 @@ async def login(interaction: discord.Interaction, key: str):
             "⚠️ Couldn't reach KeyAuth right now. Try again in a moment.", ephemeral=True
         )
         return
-
     if not valid:
         await interaction.followup.send(f"❌ Login failed: {message}", ephemeral=True)
         return
-
     set_logged_in(interaction.user, key)
-
     await interaction.followup.send(
         "✅ Key verified! You're now logged in and can use the bot's commands.",
         ephemeral=True,
     )
-
 
 @bot.tree.command(
     name="logout",
@@ -389,11 +295,8 @@ async def logout(interaction: discord.Interaction):
     if not is_logged_in(interaction.user.id):
         await interaction.response.send_message("ℹ️ You're not currently logged in.", ephemeral=True)
         return
-
     set_logged_out(interaction.user.id)
-
     await interaction.response.send_message("✅ You've been logged out.", ephemeral=True)
-
 
 @bot.tree.command(
     name="whitelist",
@@ -405,7 +308,6 @@ async def whitelist(interaction: discord.Interaction, roblox_username: str):
     await interaction.response.defer(ephemeral=True)
     if not await require_login(interaction):
         return
-
     try:
         exists, username, roblox_user_id = await roblox_user_exists(roblox_username)
     except Exception as e:
@@ -415,7 +317,6 @@ async def whitelist(interaction: discord.Interaction, roblox_username: str):
             ephemeral=True,
         )
         return
-
     if not exists:
         await interaction.followup.send(
             f"❌ No Roblox account found with username `{roblox_username}`. "
@@ -423,7 +324,6 @@ async def whitelist(interaction: discord.Interaction, roblox_username: str):
             ephemeral=True,
         )
         return
-
     guild = interaction.guild
     role = guild.get_role(WHITELIST_ROLE_ID)
     if role is None:
@@ -432,7 +332,6 @@ async def whitelist(interaction: discord.Interaction, roblox_username: str):
             ephemeral=True,
         )
         return
-
     member = interaction.user
     try:
         await member.add_roles(role, reason=f"Whitelisted via Roblox username {username}")
@@ -442,23 +341,15 @@ async def whitelist(interaction: discord.Interaction, roblox_username: str):
             ephemeral=True,
         )
         return
-
-    # Check whether the member actually holds the required role before we
-    # log or store their Roblox username; whitelisted_active always reflects
-    # this check regardless.
     has_check_role = any(r.id == CHECK_ROLE_ID for r in member.roles)
-
     await update_roblox_username(interaction.user.id, username, has_check_role)
-
     if has_check_role:
         await log_event(json.dumps({"roblox_username": username}))
-
     await interaction.followup.send(
         f"✅ Verified! Roblox account **{username}** (ID `{roblox_user_id}`) is real. "
         f"You've been given access to the channel.",
         ephemeral=True,
     )
-
 
 @bot.tree.command(
     name="info",
@@ -470,7 +361,6 @@ async def info(interaction: discord.Interaction):
     hours, remainder = divmod(uptime_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     uptime_str = f"{hours}h {minutes}m {seconds}s"
-
     embed = discord.Embed(title=f"{bot.user.name} — Info", color=discord.Color.blurple())
     embed.add_field(name="Uptime", value=uptime_str, inline=True)
     embed.add_field(name="Servers", value=str(len(bot.guilds)), inline=True)
@@ -484,7 +374,6 @@ async def info(interaction: discord.Interaction):
     embed.set_footer(text=f"Bot ID: {bot.user.id}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
 @bot.tree.command(
     name="unwhitelist",
     description="Remove your own whitelist access",
@@ -493,7 +382,6 @@ async def info(interaction: discord.Interaction):
 async def unwhitelist(interaction: discord.Interaction):
     if not await require_login(interaction):
         return
-
     guild = interaction.guild
     role = guild.get_role(WHITELIST_ROLE_ID)
     if role is None:
@@ -502,14 +390,12 @@ async def unwhitelist(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
-
     member = interaction.user
     if role not in member.roles:
         await interaction.response.send_message(
             "ℹ️ You don't currently have whitelist access.", ephemeral=True
         )
         return
-
     try:
         await member.remove_roles(role, reason="Self-unwhitelisted")
     except discord.Forbidden:
@@ -518,17 +404,13 @@ async def unwhitelist(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
-
-    # Remove their Roblox username from JSONBin, then log them out
     roblox_username = get_session_roblox_username(member.id)
     await remove_roblox_username(roblox_username)
     set_logged_out(member.id)
-
     await interaction.response.send_message(
         "✅ You've been unwhitelisted, logged out, and no longer have access to the channel.",
         ephemeral=True,
     )
-
 
 @bot.tree.command(
     name="forceunwhitelist",
@@ -542,7 +424,6 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
             "❌ You don't have permission to use this command.", ephemeral=True
         )
         return
-
     guild = interaction.guild
     role = guild.get_role(WHITELIST_ROLE_ID)
     if role is None:
@@ -551,13 +432,11 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
             ephemeral=True,
         )
         return
-
     if role not in member.roles:
         await interaction.response.send_message(
             f"ℹ️ {member.mention} doesn't currently have whitelist access.", ephemeral=True
         )
         return
-
     try:
         await member.remove_roles(role, reason=f"Force-unwhitelisted by {interaction.user}")
     except discord.Forbidden:
@@ -566,15 +445,12 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
             ephemeral=True,
         )
         return
-
     roblox_username = get_session_roblox_username(member.id)
     await remove_roblox_username(roblox_username)
     set_logged_out(member.id)
-
     await interaction.response.send_message(
         f"✅ {member.mention} has been forcefully unwhitelisted and logged out.", ephemeral=True
     )
-
 
 @bot.tree.command(
     name="say",
@@ -588,10 +464,8 @@ async def say(interaction: discord.Interaction, message: str):
             "❌ You don't have permission to use this command.", ephemeral=True
         )
         return
-
     await interaction.response.send_message("✅ Sent.", ephemeral=True)
     await interaction.channel.send(message)
-
 
 @bot.tree.command(
     name="imagetogif",
@@ -603,22 +477,18 @@ async def imagetogif(interaction: discord.Interaction, image: discord.Attachment
     await interaction.response.defer()
     if not await require_login(interaction):
         return
-
     if not (image.content_type and image.content_type.startswith("image/")):
         await interaction.followup.send("❌ That attachment isn't an image.", ephemeral=True)
         return
-
     MAX_SIZE = 8 * 1024 * 1024
     if image.size > MAX_SIZE:
         await interaction.followup.send(
             "❌ That image is too large to convert (max 8MB).", ephemeral=True
         )
         return
-
     try:
         image_bytes = await image.read()
         source = Image.open(io.BytesIO(image_bytes))
-
         output_buffer = io.BytesIO()
         if getattr(source, "is_animated", False):
             frames = [frame.convert("RGBA") for frame in ImageSequence.Iterator(source)]
@@ -632,7 +502,6 @@ async def imagetogif(interaction: discord.Interaction, image: discord.Attachment
             )
         else:
             source.convert("RGBA").save(output_buffer, format="GIF")
-
         output_buffer.seek(0)
     except Exception as e:
         log.exception("Error converting image to GIF: %s", e)
@@ -640,13 +509,11 @@ async def imagetogif(interaction: discord.Interaction, image: discord.Attachment
             "⚠️ Something went wrong converting that image.", ephemeral=True
         )
         return
-
     filename = os.path.splitext(image.filename)[0] + ".gif"
     await interaction.followup.send(
         content="✅ Here's your GIF:",
         file=discord.File(fp=output_buffer, filename=filename),
     )
-
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
