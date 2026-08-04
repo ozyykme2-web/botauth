@@ -81,14 +81,14 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# In-memory list of logged-in session records. Each record looks like:
-# {
-#   "discord_username": "someuser",
-#   "discord_user_id": "123456789012345678",
-#   "roblox_username": "SomeRobloxUser" or None,
-#   "key": "XXXX-XXXX-XXXX-XXXX",
-# }
-bot.logged_in_users: list[dict] = []
+# In-memory only — who is currently logged in via /login. NOT synced to
+# JSONBin (JSONBin holds only whitelisted Roblox usernames, nothing else).
+# Maps discord_user_id (str) -> {"key": ..., "roblox_username": ... or None}
+bot.logged_in_users: dict[str, dict] = {}
+
+# The only thing persisted to JSONBin: a flat list of Roblox usernames that
+# currently have the required role.
+bot.roblox_usernames: list[str] = []
 
 
 # ---------- Webhook logging ----------
@@ -112,7 +112,7 @@ def fmt_user(user: discord.abc.User) -> str:
     return f"{user} ({user.id})"
 
 
-# ---------- JSONBin sync ----------
+# ---------- JSONBin sync (roblox usernames only) ----------
 
 async def jsonbin_load() -> dict:
     """Fetch the current bin contents. Returns {} if empty/unreachable."""
@@ -133,12 +133,12 @@ async def jsonbin_load() -> dict:
 
 
 async def jsonbin_save():
-    """Push the current in-memory logged_in_users list to JSONBin."""
+    """Push the current in-memory roblox_usernames list to JSONBin — nothing else."""
     headers = {
         "X-Master-Key": JSONBIN_API_KEY,
         "Content-Type": "application/json",
     }
-    payload = {"logged_in_users": bot.logged_in_users}
+    payload = {"roblox_usernames": bot.roblox_usernames}
     timeout = aiohttp.ClientTimeout(total=8)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -150,64 +150,53 @@ async def jsonbin_save():
         log.exception("Error saving JSONBin: %s", e)
 
 
-def _find_record(user_id: int) -> dict | None:
-    uid = str(user_id)
-    for rec in bot.logged_in_users:
-        if rec.get("discord_user_id") == uid:
-            return rec
-    return None
+async def add_roblox_username(username: str):
+    if username not in bot.roblox_usernames:
+        bot.roblox_usernames.append(username)
+        await jsonbin_save()
 
 
-async def set_logged_in(
-    user: discord.abc.User,
-    key: str,
-    roblox_username: str | None = None,
-):
-    """Add or update a session record, then re-sync to JSONBin."""
-    existing = _find_record(user.id)
-    if existing is not None:
-        existing["discord_username"] = str(user)
-        existing["key"] = key
-        if roblox_username is not None:
-            existing["roblox_username"] = roblox_username
-    else:
-        bot.logged_in_users.append(
-            {
-                "discord_username": str(user),
-                "discord_user_id": str(user.id),
-                "roblox_username": roblox_username,
-                "whitelisted_active": False,
-                "key": key,
-            }
-        )
-    await jsonbin_save()
+async def remove_roblox_username(username: str | None):
+    if username and username in bot.roblox_usernames:
+        bot.roblox_usernames.remove(username)
+        await jsonbin_save()
+
+
+# ---------- In-memory login sessions (not persisted) ----------
+
+def set_logged_in(user: discord.abc.User, key: str):
+    bot.logged_in_users[str(user.id)] = {"key": key, "roblox_username": None}
+
+
+def set_logged_out(user_id: int):
+    bot.logged_in_users.pop(str(user_id), None)
+
+
+def is_logged_in(user_id: int) -> bool:
+    return str(user_id) in bot.logged_in_users
+
+
+def get_session_roblox_username(user_id: int) -> str | None:
+    rec = bot.logged_in_users.get(str(user_id))
+    return rec.get("roblox_username") if rec else None
 
 
 async def update_roblox_username(user_id: int, roblox_username: str, has_check_role: bool):
     """
-    Update the whitelist status on an existing session record.
-    The Roblox username is only recorded if the member currently has
-    CHECK_ROLE_ID; `whitelisted_active` always reflects that role check.
+    Record which Roblox username this Discord user last whitelisted (in
+    memory, for /unwhitelist to know what to remove later), and sync JSONBin
+    with just the plain list of currently-whitelisted Roblox usernames.
     """
-    rec = _find_record(user_id)
+    rec = bot.logged_in_users.get(str(user_id))
+    old_username = rec.get("roblox_username") if rec else None
+
     if rec is not None:
-        rec["whitelisted_active"] = has_check_role
-        if has_check_role:
-            rec["roblox_username"] = roblox_username
-        await jsonbin_save()
+        rec["roblox_username"] = roblox_username if has_check_role else old_username
 
-
-async def set_logged_out(user_id: int):
-    before = len(bot.logged_in_users)
-    bot.logged_in_users = [
-        rec for rec in bot.logged_in_users if rec.get("discord_user_id") != str(user_id)
-    ]
-    if len(bot.logged_in_users) != before:
-        await jsonbin_save()
-
-
-def is_logged_in(user_id: int) -> bool:
-    return _find_record(user_id) is not None
+    if has_check_role:
+        if old_username and old_username != roblox_username:
+            await remove_roblox_username(old_username)
+        await add_roblox_username(roblox_username)
 
 
 # ---------- KeyAuth ----------
@@ -332,10 +321,11 @@ async def on_ready():
     except Exception as e:
         log.exception("Failed to sync commands: %s", e)
 
-    # Restore session state from JSONBin on startup
+    # Restore the whitelisted Roblox usernames list from JSONBin on startup.
+    # Login sessions are in-memory only now and do NOT persist across restarts.
     record = await jsonbin_load()
-    bot.logged_in_users = record.get("logged_in_users", []) or []
-    log.info(f"Restored {len(bot.logged_in_users)} logged-in session(s) from JSONBin")
+    bot.roblox_usernames = record.get("roblox_usernames", []) or []
+    log.info(f"Restored {len(bot.roblox_usernames)} roblox username(s) from JSONBin")
 
     log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
@@ -382,7 +372,7 @@ async def login(interaction: discord.Interaction, key: str):
         await interaction.followup.send(f"❌ Login failed: {message}", ephemeral=True)
         return
 
-    await set_logged_in(interaction.user, key)
+    set_logged_in(interaction.user, key)
 
     await interaction.followup.send(
         "✅ Key verified! You're now logged in and can use the bot's commands.",
@@ -400,7 +390,7 @@ async def logout(interaction: discord.Interaction):
         await interaction.response.send_message("ℹ️ You're not currently logged in.", ephemeral=True)
         return
 
-    await set_logged_out(interaction.user.id)
+    set_logged_out(interaction.user.id)
 
     await interaction.response.send_message("✅ You've been logged out.", ephemeral=True)
 
@@ -529,8 +519,10 @@ async def unwhitelist(interaction: discord.Interaction):
         )
         return
 
-    # Unwhitelisting also revokes their KeyAuth session + JSONBin entry
-    await set_logged_out(member.id)
+    # Remove their Roblox username from JSONBin, then log them out
+    roblox_username = get_session_roblox_username(member.id)
+    await remove_roblox_username(roblox_username)
+    set_logged_out(member.id)
 
     await interaction.response.send_message(
         "✅ You've been unwhitelisted, logged out, and no longer have access to the channel.",
@@ -575,7 +567,9 @@ async def forceunwhitelist(interaction: discord.Interaction, member: discord.Mem
         )
         return
 
-    await set_logged_out(member.id)
+    roblox_username = get_session_roblox_username(member.id)
+    await remove_roblox_username(roblox_username)
+    set_logged_out(member.id)
 
     await interaction.response.send_message(
         f"✅ {member.mention} has been forcefully unwhitelisted and logged out.", ephemeral=True
